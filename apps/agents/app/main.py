@@ -3,7 +3,6 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,7 +85,7 @@ webhook_events = WebhookEventStore()
 
 
 # Background webhook processing
-def process_webhook_review(event: dict, key: tuple) -> None:
+def process_webhook_review(event: dict, key: tuple[str, int, str]) -> None:
     try:
         result = initiate_review(event)
 
@@ -454,6 +453,7 @@ def publish_github_review(payload: GitHubPublishInput):
         code = (
             409
             if result["status"] == "stale_head_sha"
+            or result["status"] == "closed_pr"
             else 422
             if result["status"] == "rejected_invalid_locations"
             else 200

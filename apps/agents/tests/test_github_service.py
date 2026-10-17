@@ -25,6 +25,84 @@ def test_dry_run_does_not_publish():
     assert client.posted is None
 
 
+def test_publish_review_posts_validated_comments_with_right_side():
+    client = FakeGitHub()
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[{"path": "src/example.js", "line": 2, "body": "Check this."}],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "published"
+    assert client.posted == [{
+        "path": "src/example.js",
+        "line": 2,
+        "side": "RIGHT",
+        "body": "Check this.",
+    }]
+
+
+def test_publish_review_rejects_invalid_locations_without_posting():
+    client = FakeGitHub()
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[{"path": "src/example.js", "line": 99, "body": "Check this."}],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "rejected_invalid_locations"
+    assert client.posted is None
+
+
+def test_publish_review_rejects_outdated_head_without_posting():
+    client = FakeGitHub(sha="current1234567")
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha="old1234567",
+        summary="Review",
+        dry_run=False,
+        comments=[{"path": "src/example.js", "line": 2, "body": "Check this."}],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "stale_head_sha"
+    assert client.posted is None
+
+
+def test_publish_review_reports_missing_permission():
+    class ForbiddenClient(FakeGitHub):
+        def create_review(self, *args):
+            raise GitHubAPIError(403, "GitHub token lacks permission to publish pull request reviews.")
+
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha="abcdef1234567",
+        summary="Review",
+        dry_run=False,
+        comments=[{"path": "src/example.js", "line": 2, "body": "Check this."}],
+    )
+
+    with pytest.raises(GitHubAPIError, match="lacks permission"):
+        publish_review(payload, ForbiddenClient())
+
+
 class FakeFixGitHub:
     def __init__(self, state="open", sha="abcdef1234567"):
         self.state, self.sha, self.commits = state, sha, []

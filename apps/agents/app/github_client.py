@@ -93,6 +93,11 @@ class GitHubClient:
             timeout=self.timeout,
         )
         if not response.ok:
+            if response.status_code in (401, 403):
+                raise GitHubAPIError(
+                    response.status_code,
+                    "GitHub token lacks permission to publish pull request reviews.",
+                )
             raise GitHubAPIError(response.status_code, f"GitHub review publication failed ({response.status_code}).")
         return response.json()
 

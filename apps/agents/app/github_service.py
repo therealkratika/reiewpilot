@@ -33,7 +33,7 @@ def publish_review(payload: GitHubPublishInput, client=None) -> dict[str, Any]:
         if c.line not in changed.get(path, set()):
             rejected.append({"path": path, "line": c.line, "reason": "Line is not added in current diff."})
         else:
-            comments.append({"path": path, "line": c.line, "body": c.body})
+            comments.append({"path": path, "line": c.line, "side": "RIGHT", "body": c.body})
     if rejected:
         return {"status": "rejected_invalid_locations", "published": False,
                 "accepted_comment_count": len(comments), "rejected_comments": rejected}

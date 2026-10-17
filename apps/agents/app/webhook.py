@@ -6,7 +6,9 @@ from collections import OrderedDict
 from typing import Any
 
 from .pipeline import run_github_review_pipeline
-from .schemas import GitHubPipelineInput
+from .github_client import GitHubClient
+from .github_service import publish_review
+from .schemas import GitHubPipelineInput, GitHubPublishInput
 
 RELEVANT_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 MAX_PROCESSED_EVENTS = 10_000
@@ -14,11 +16,11 @@ MAX_PROCESSED_EVENTS = 10_000
 
 class WebhookEventStore:
     def __init__(self, max_events: int = MAX_PROCESSED_EVENTS):
-        self._events: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
+        self._events: OrderedDict[tuple[str, int, str], None] = OrderedDict()
         self._lock = threading.Lock()
         self._max_events = max_events
 
-    def claim(self, key: tuple[str, int, str, str]) -> bool:
+    def claim(self, key: tuple[str, int, str]) -> bool:
         with self._lock:
             if key in self._events:
                 return False
@@ -28,7 +30,7 @@ class WebhookEventStore:
                 self._events.popitem(last=False)
             return True
 
-    def release(self, key: tuple[str, int, str, str]) -> None:
+    def release(self, key: tuple[str, int, str]) -> None:
         with self._lock:
             self._events.pop(key, None)
 
@@ -75,15 +77,48 @@ def parse_pull_request_event(body: bytes) -> dict[str, Any]:
     }
 
 
-def event_key(event: dict[str, Any]) -> tuple[str, int, str, str]:
-    return (f"{event['owner']}/{event['repo']}", event["pull_number"], event["head_sha"], event["action"])
+def event_key(event: dict[str, Any]) -> tuple[str, int, str]:
+    return (f"{event['owner']}/{event['repo']}", event["pull_number"], event["head_sha"])
 
 
-def initiate_review(event: dict[str, Any]) -> dict[str, Any]:
-    return run_github_review_pipeline(
+def _finding_comment(finding: dict[str, Any]) -> dict[str, Any]:
+    severity = str(finding["severity"]).capitalize()
+    body = (
+        f"**{severity}: {finding['title']}**\n\n"
+        f"{finding['description']}\n\n"
+        f"**Evidence:** {finding['evidence']}\n\n"
+        f"**Suggested fix:** {finding['suggested_fix']}"
+    )
+    return {
+        "path": finding["file_path"],
+        "line": finding["line_start"],
+        "body": body,
+    }
+
+
+def initiate_review(event: dict[str, Any], client=None) -> dict[str, Any]:
+    client = client or GitHubClient()
+    result = run_github_review_pipeline(
         event["owner"],
         event["repo"],
         event["pull_number"],
-        GitHubPipelineInput(propose_fix=True, validate_fix=False),
+        GitHubPipelineInput(propose_fix=False, validate_fix=False),
+        client=client,
         auto_select_target=True,
     )
+    if result.get("status") != "review_completed":
+        return result
+
+    review = result["review"]
+    payload = GitHubPublishInput(
+        owner=event["owner"],
+        repo=event["repo"],
+        pull_number=event["pull_number"],
+        expected_head_sha=event["head_sha"],
+        summary=review["summary"],
+        event="COMMENT",
+        dry_run=False,
+        comments=[_finding_comment(finding) for finding in review["findings"]],
+    )
+    published = publish_review(payload, client=client)
+    return {**result, "publication": published, "published": published["published"]}
