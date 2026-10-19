@@ -1,7 +1,27 @@
+import hashlib
+import json
 from typing import Any
 from .diff_parser import added_lines_by_file
 from .github_client import GitHubAPIError, GitHubClient
 from .schemas import GitHubFixPublishInput, GitHubPublishInput
+
+
+def _review_idempotency_marker(payload, comments):
+    review_data = {
+        "repository": f"{payload.owner}/{payload.repo}",
+        "pull_number": payload.pull_number,
+        "head_sha": payload.expected_head_sha,
+        "summary": payload.summary,
+        "event": payload.event,
+        "comments": comments,
+    }
+    serialized = json.dumps(
+        review_data,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(serialized.encode()).hexdigest()
+    return f"<!-- reviewpilot:{digest} -->"
 
 
 def pull_request_snapshot(owner: str, repo: str, pull_number: int, client=None) -> dict[str, Any]:
@@ -32,17 +52,65 @@ def publish_review(payload: GitHubPublishInput, client=None) -> dict[str, Any]:
         path = c.path.removeprefix("a/").removeprefix("b/")
         if c.line not in changed.get(path, set()):
             rejected.append({"path": path, "line": c.line, "reason": "Line is not added in current diff."})
-        else:
-            comments.append({"path": path, "line": c.line, "side": "RIGHT", "body": c.body})
+            continue
+        comment = {
+            "path": path,
+            "line": c.line,
+            "side": "RIGHT",
+            "body": c.body,
+        }
+        if c.start_line is not None:
+            if c.start_line >= c.line:
+                rejected.append({
+                    "path": path,
+                    "line": c.line,
+                    "reason": "start_line must be less than line.",
+                })
+                continue
+            if c.start_line not in changed.get(path, set()):
+                rejected.append({
+                    "path": path,
+                    "line": c.line,
+                    "reason": "Start line is not added in current diff.",
+                })
+                continue
+            comment["start_line"] = c.start_line
+            comment["start_side"] = "RIGHT"
+        comments.append(comment)
     if rejected:
         return {"status": "rejected_invalid_locations", "published": False,
                 "accepted_comment_count": len(comments), "rejected_comments": rejected}
+    marker = _review_idempotency_marker(payload, comments)
     if payload.dry_run:
         return {"status": "dry_run", "published": False,
             "message": "Locations and SHA validated; no write request was sent.",
             "comment_count": len(comments), "event": payload.event, "head_sha": current_sha}
-    result = client.create_review(payload.owner, payload.repo, payload.pull_number,
-                                  payload.summary, payload.event, comments)
+    existing_reviews = client.get_pull_reviews(
+        payload.owner,
+        payload.repo,
+        payload.pull_number,
+    )
+    for review in existing_reviews:
+        if (
+            review.get("commit_id") == current_sha
+            and marker in (review.get("body") or "")
+        ):
+            return {
+                "status": "duplicate_review",
+                "published": False,
+                "message": "This review has already been published.",
+                "review_id": review.get("id"),
+                "head_sha": current_sha,
+            }
+    result = client.create_review(
+        payload.owner,
+        payload.repo,
+        payload.pull_number,
+        f"{payload.summary}\n\n{marker}",
+        payload.event,
+        comments,
+        commit_id=current_sha,
+    )
     return {"status": "published", "published": True, "review_id": result.get("id"),
             "html_url": result.get("html_url"), "comment_count": len(comments), "head_sha": current_sha}
 

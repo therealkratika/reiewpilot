@@ -1,18 +1,21 @@
 import pytest
 
 from app.github_client import GitHubAPIError
-from app.github_service import publish_fix, publish_review
+from app.github_service import _review_idempotency_marker, publish_fix, publish_review
 from app.schemas import GitHubFixPublishInput, GitHubPublishInput
 
 
 class FakeGitHub:
     def __init__(self, sha="abcdef1234567"):
-        self.sha, self.posted = sha, None
+        self.sha, self.posted, self.commit_id = sha, None, None
     def get_pull_request(self, owner, repo, number):
         return {"head": {"sha": self.sha}}
     def get_pull_diff(self, owner, repo, number):
         return "diff --git a/src/example.js b/src/example.js\n--- a/src/example.js\n+++ b/src/example.js\n@@ -1,1 +1,2 @@\n const a = 1;\n+const b = 2;\n"
-    def create_review(self, owner, repo, number, body, event, comments):
+    def get_pull_reviews(self, owner, repo, number):
+        return []
+    def create_review(self, owner, repo, number, body, event, comments, commit_id=None):
+        self.commit_id = commit_id
         self.posted = comments
         return {"id": 1, "html_url": "https://example.invalid/review"}
 
@@ -46,6 +49,60 @@ def test_publish_review_posts_validated_comments_with_right_side():
         "side": "RIGHT",
         "body": "Check this.",
     }]
+    assert client.commit_id == client.sha
+
+
+def test_publish_review_posts_validated_multiline_comment():
+    client = FakeGitHub()
+    client.get_pull_diff = lambda *args: (
+        "diff --git a/src/example.js b/src/example.js\n"
+        "--- a/src/example.js\n+++ b/src/example.js\n"
+        "@@ -1,1 +1,3 @@\n"
+        " const a = 1;\n+const b = 2;\n+const c = 3;\n"
+    )
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[{
+            "path": "src/example.js",
+            "start_line": 2,
+            "line": 3,
+            "body": "Check this range.",
+        }],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "published"
+    assert client.posted[0]["start_line"] == 2
+    assert client.posted[0]["start_side"] == "RIGHT"
+
+
+def test_publish_review_rejects_invalid_multiline_range():
+    client = FakeGitHub()
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[{
+            "path": "src/example.js",
+            "start_line": 2,
+            "line": 2,
+            "body": "Invalid range.",
+        }],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "rejected_invalid_locations"
+    assert result["rejected_comments"][0]["reason"] == "start_line must be less than line."
 
 
 def test_publish_review_rejects_invalid_locations_without_posting():
@@ -86,7 +143,7 @@ def test_publish_review_rejects_outdated_head_without_posting():
 
 def test_publish_review_reports_missing_permission():
     class ForbiddenClient(FakeGitHub):
-        def create_review(self, *args):
+        def create_review(self, *args, commit_id=None):
             raise GitHubAPIError(403, "GitHub token lacks permission to publish pull request reviews.")
 
     payload = GitHubPublishInput(
@@ -101,6 +158,46 @@ def test_publish_review_reports_missing_permission():
 
     with pytest.raises(GitHubAPIError, match="lacks permission"):
         publish_review(payload, ForbiddenClient())
+
+
+def test_publish_review_prevents_duplicate_review():
+    class DuplicateGitHub(FakeGitHub):
+        def get_pull_reviews(self, owner, repo, number):
+            return [{"id": 123, "commit_id": self.sha, "body": self.marker}]
+
+        def create_review(self, *args, **kwargs):
+            raise AssertionError("Duplicate review should not be published.")
+
+    client = DuplicateGitHub()
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[
+            {
+                "path": "src/example.js",
+                "line": 2,
+                "body": "Check this.",
+            }
+        ],
+    )
+    client.marker = _review_idempotency_marker(
+        payload,
+        [{
+            "path": "src/example.js",
+            "line": 2,
+            "side": "RIGHT",
+            "body": "Check this.",
+        }],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "duplicate_review"
+    assert result["review_id"] == 123
 
 
 class FakeFixGitHub:

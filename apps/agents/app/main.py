@@ -1,6 +1,7 @@
 
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -27,6 +28,7 @@ from .schemas import (
 from .validator import run_docker_validation
 from .workflow import run_review_and_fix, run_review_fix_validate
 from .webhook import (
+    RedisWebhookEventStore,
     WebhookEventStore,
     event_key,
     initiate_review,
@@ -81,11 +83,44 @@ app.add_middleware(
 
 
 # Webhook event store
-webhook_events = WebhookEventStore()
+redis_url = os.getenv("REDIS_URL")
+
+if redis_url:
+    webhook_events = RedisWebhookEventStore(redis_url)
+else:
+    logger.warning(
+        "REDIS_URL is missing. Using in-memory webhook storage."
+    )
+    webhook_events = WebhookEventStore()
 
 
 # Background webhook processing
+def keep_webhook_lock_alive(
+    key: tuple[str, int, str],
+    stop_event: threading.Event,
+) -> None:
+    refresh = getattr(webhook_events, "refresh", None)
+    if refresh is None:
+        return
+    interval = 300
+    while not stop_event.wait(interval):
+        try:
+            if not refresh(key):
+                logger.warning("Webhook lock lost: %s", key)
+                return
+        except Exception:
+            logger.exception("Failed to refresh webhook lock: %s", key)
+            return
+
+
 def process_webhook_review(event: dict, key: tuple[str, int, str]) -> None:
+    stop_event = threading.Event()
+    heartbeat = threading.Thread(
+        target=keep_webhook_lock_alive,
+        args=(key, stop_event),
+        daemon=True,
+    )
+    heartbeat.start()
     try:
         result = initiate_review(event)
 
@@ -114,6 +149,9 @@ def process_webhook_review(event: dict, key: tuple[str, int, str]) -> None:
             event["pull_number"],
             event["head_sha"],
         )
+    finally:
+        stop_event.set()
+        heartbeat.join()
 
 
 # Health check

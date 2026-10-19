@@ -55,17 +55,45 @@ class GitHubClient:
         return response.text
 
     def get_pull_files(self, owner, repo, pull_number):
+        safe_owner = self._identifier(owner, "owner")
+        safe_repo = self._identifier(repo, "repository")
+        all_files = []
+        page = 1
+        while True:
+            response = requests.get(
+                f"{self.api_url}/repos/{safe_owner}/{safe_repo}/pulls/{pull_number}/files",
+                headers=self._headers(),
+                params={"per_page": 100, "page": page},
+                timeout=self.timeout,
+            )
+            if not response.ok:
+                raise GitHubAPIError(
+                    response.status_code,
+                    f"GitHub changed-file lookup failed ({response.status_code}).",
+                )
+            data = response.json()
+            if not isinstance(data, list):
+                raise GitHubAPIError(502, "Unexpected changed-files response.")
+            all_files.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+        return all_files
+
+    def get_pull_reviews(self, owner, repo, pull_number):
+        safe_owner = self._identifier(owner, "owner")
+        safe_repo = self._identifier(repo, "repository")
         response = requests.get(
-            f"{self.api_url}/repos/{self._identifier(owner, 'owner')}/{self._identifier(repo, 'repository')}/pulls/{pull_number}/files",
+            f"{self.api_url}/repos/{safe_owner}/{safe_repo}/pulls/{pull_number}/reviews",
             headers=self._headers(),
-            params={"per_page": 100},
+            params={"per_page": 100, "page": 1},
             timeout=self.timeout,
         )
         if not response.ok:
-            raise GitHubAPIError(response.status_code, f"GitHub changed-file lookup failed ({response.status_code}).")
+            raise GitHubAPIError(response.status_code, f"GitHub review lookup failed ({response.status_code}).")
         data = response.json()
         if not isinstance(data, list):
-            raise GitHubAPIError(502, "Unexpected changed-files response.")
+            raise GitHubAPIError(502, "Unexpected GitHub reviews response.")
         return data
 
     def get_file_content(self, owner, repo, path, ref):
@@ -85,11 +113,25 @@ class GitHubClient:
             raise GitHubAPIError(422, "File is not available as a regular base64-encoded file.")
         return base64.b64decode(data["content"]).decode("utf-8")
 
-    def create_review(self, owner, repo, pull_number, body, event, comments):
+    def create_review(
+        self,
+        owner,
+        repo,
+        pull_number,
+        body,
+        event,
+        comments,
+        commit_id=None,
+    ):
         response = requests.post(
             f"{self.api_url}/repos/{self._identifier(owner, 'owner')}/{self._identifier(repo, 'repository')}/pulls/{pull_number}/reviews",
             headers=self._headers(),
-            json={"body": body, "event": event, "comments": comments},
+            json={
+                "body": body,
+                "event": event,
+                "comments": comments,
+                "commit_id": commit_id,
+            },
             timeout=self.timeout,
         )
         if not response.ok:

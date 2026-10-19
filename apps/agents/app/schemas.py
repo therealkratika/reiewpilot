@@ -24,7 +24,8 @@ class GitHubPublishComment(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str = Field(min_length=1, max_length=500)
     line: int = Field(ge=1)
-    body: str = Field(min_length=3, max_length=5000)
+    start_line: int | None = Field(default=None, ge=1)
+    body: str = Field(min_length=1, max_length=5000)
 
 
 class GitHubPublishInput(BaseModel):

@@ -5,7 +5,12 @@ import json
 from fastapi.testclient import TestClient
 
 from app import main
-from app.webhook import WebhookEventStore, initiate_review
+from app.webhook import (
+    RedisWebhookEventStore,
+    WebhookEventStore,
+    _finding_comment,
+    initiate_review,
+)
 from app.schemas import Finding, ReviewAnalysis
 
 
@@ -154,8 +159,11 @@ def test_initiate_review_publishes_comment_only_review(monkeypatch):
         def get_pull_files(self, owner, repo, number):
             return [{"filename": "src/a.js", "status": "modified", "additions": 1, "deletions": 0}]
 
-        def create_review(self, owner, repo, number, body, event, comments):
-            self.review = (body, event, comments)
+        def get_pull_reviews(self, owner, repo, number):
+            return []
+
+        def create_review(self, owner, repo, number, body, event, comments, commit_id=None):
+            self.review = (body, event, comments, commit_id)
             return {"id": 4, "html_url": "https://example.invalid/review/4"}
 
     finding = Finding(
@@ -183,13 +191,249 @@ def test_initiate_review_publishes_comment_only_review(monkeypatch):
 
     assert result["published"] is True
     assert client.review[1] == "COMMENT"
+    assert client.review[3] == "a" * 40
     assert client.review[2][0]["path"] == "src/a.js"
     assert client.review[2][0]["line"] == 2
     assert "**Critical: Unsafe change**" in client.review[2][0]["body"]
     assert "Suggested fix" in client.review[2][0]["body"]
 
 
+def test_finding_comment_preserves_multiline_range():
+    comment = _finding_comment({
+        "severity": "high",
+        "title": "Range issue",
+        "description": "The change has an issue.",
+        "evidence": "The added range is unsafe.",
+        "suggested_fix": "Correct the range.",
+        "file_path": "src/a.js",
+        "line_start": 2,
+        "line_end": 4,
+    })
+
+    assert comment["line"] == 4
+    assert comment["start_line"] == 2
+
+
+def test_initiate_review_skips_stale_webhook(monkeypatch):
+    class FakeClient:
+        def get_pull_request(self, owner, repo, number):
+            return {"head": {"sha": "b" * 40}}
+
+    def unexpected_pipeline(*args, **kwargs):
+        raise AssertionError("Pipeline should not run for stale webhook.")
+
+    monkeypatch.setattr(
+        "app.webhook.run_github_review_pipeline",
+        unexpected_pipeline,
+    )
+    result = initiate_review(
+        {
+            "owner": "acme",
+            "repo": "widgets",
+            "pull_number": 7,
+            "head_sha": "a" * 40,
+        },
+        client=FakeClient(),
+    )
+
+    assert result["status"] == "stale_webhook"
+    assert result["published"] is False
+
+
+def test_initiate_review_skips_empty_review(monkeypatch):
+    class FakeClient:
+        def get_pull_request(self, owner, repo, number):
+            return {"head": {"sha": "a" * 40}}
+
+    pipeline_result = {
+        "status": "review_completed",
+        "review": {
+            "summary": "No issues found.",
+            "findings": [],
+        },
+    }
+    monkeypatch.setattr(
+        "app.webhook.run_github_review_pipeline",
+        lambda *args, **kwargs: pipeline_result,
+    )
+    result = initiate_review(
+        {
+            "owner": "acme",
+            "repo": "widgets",
+            "pull_number": 7,
+            "head_sha": "a" * 40,
+        },
+        client=FakeClient(),
+    )
+
+    assert result["status"] == "no_findings"
+    assert result["published"] is False
+    assert result["publication"]["status"] == "skipped"
+
+
 def test_missing_webhook_secret_is_reported(monkeypatch):
     monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
     response = client.post("/v1/github/webhooks", content=b"{}")
     assert response.status_code == 503
+
+
+def test_redis_webhook_event_store_claim_and_release(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.data = {}
+            self.calls = []
+
+        def set(self, key, value, nx=False, ex=None):
+            self.calls.append(("set", (key, value), {"nx": nx, "ex": ex}))
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def eval(self, script, numkeys, key, token):
+            self.calls.append(("eval", (script, numkeys, key, token)))
+            if self.data.get(key) == token:
+                del self.data[key]
+                return 1
+            return 0
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        "app.webhook.redis.Redis.from_url",
+        lambda *args, **kwargs: fake_redis,
+    )
+    store = RedisWebhookEventStore("redis://localhost:6379/0", ttl_seconds=60)
+    key = ("acme/widgets", 7, "a" * 40)
+
+    assert store.claim(key) is True
+    store.release(key)
+
+    assert fake_redis.calls[0][0] == "set"
+    assert fake_redis.calls[0][1][0] == "reviewpilot:webhook:acme/widgets:7:" + "a" * 40
+    assert fake_redis.calls[0][2] == {"nx": True, "ex": 60}
+    assert fake_redis.calls[1][0] == "eval"
+
+
+def test_redis_event_store_claims_event_once(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.data = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def eval(self, script, numkeys, key, token):
+            if self.data.get(key) == token:
+                del self.data[key]
+                return 1
+            return 0
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        "app.webhook.redis.Redis.from_url",
+        lambda *args, **kwargs: fake_redis,
+    )
+    store = RedisWebhookEventStore("redis://localhost:6379/0")
+    event = ("acme/widgets", 7, "abc123")
+
+    assert store.claim(event) is True
+    assert store.claim(event) is False
+
+
+def test_redis_event_store_releases_event(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.data = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def eval(self, script, numkeys, key, token):
+            if self.data.get(key) == token:
+                del self.data[key]
+                return 1
+            return 0
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        "app.webhook.redis.Redis.from_url",
+        lambda *args, **kwargs: fake_redis,
+    )
+    store = RedisWebhookEventStore("redis://localhost:6379/0")
+    event = ("acme/widgets", 7, "abc123")
+
+    assert store.claim(event) is True
+    store.release(event)
+    assert store.claim(event) is True
+
+
+def test_redis_release_does_not_delete_another_workers_lock(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.data = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def eval(self, script, numkeys, key, token):
+            if self.data.get(key) == token:
+                del self.data[key]
+                return 1
+            return 0
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        "app.webhook.redis.Redis.from_url",
+        lambda *args, **kwargs: fake_redis,
+    )
+    first_store = RedisWebhookEventStore("redis://localhost:6379/0")
+    second_store = RedisWebhookEventStore("redis://localhost:6379/0")
+    event = ("acme/widgets", 7, "abc123")
+
+    assert first_store.claim(event) is True
+    redis_key = first_store._key(event)
+    del fake_redis.data[redis_key]
+    assert second_store.claim(event) is True
+
+    first_store.release(event)
+
+    assert redis_key in fake_redis.data
+
+
+def test_redis_refresh_only_renews_owned_lock(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.data = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def eval(self, script, numkeys, key, token, ttl):
+            if self.data.get(key) == token:
+                return 1
+            return 0
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        "app.webhook.redis.Redis.from_url",
+        lambda *args, **kwargs: fake_redis,
+    )
+    store = RedisWebhookEventStore("redis://localhost:6379/0")
+    event = ("acme/widgets", 7, "abc123")
+
+    assert store.claim(event) is True
+    assert store.refresh(event) is True
+    fake_redis.data[store._key(event)] = "another-worker-token"
+    assert store.refresh(event) is False
