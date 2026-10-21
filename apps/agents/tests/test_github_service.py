@@ -279,7 +279,12 @@ def fix_payload(**overrides):
 
 
 def test_fix_publish_rejects_stale_head_sha():
-    assert publish_fix(fix_payload(), FakeFixGitHub(sha="different123"))["status"] == "stale_head_sha"
+    client = FakeFixGitHub(sha="different123")
+
+    result = publish_fix(fix_payload(), client)
+
+    assert result["status"] == "stale_head_sha"
+    assert client.commits == []
 
 
 def test_fix_publish_rejects_closed_pr():

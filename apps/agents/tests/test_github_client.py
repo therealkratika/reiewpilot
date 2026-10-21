@@ -99,3 +99,18 @@ def test_get_retries_rate_limited_read(monkeypatch):
 
     assert result == {"state": "open"}
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("status_code", [403, 404, 422])
+def test_pull_lookup_surfaces_github_api_errors(monkeypatch, status_code):
+    client = GitHubClient(token="test-token")
+    response = Mock()
+    response.status_code = status_code
+    response.ok = False
+    response.headers = {}
+    monkeypatch.setattr("app.github_client.requests.get", lambda *args, **kwargs: response)
+
+    with pytest.raises(GitHubAPIError) as raised:
+        client.get_pull_request("acme", "widgets", 7)
+
+    assert raised.value.status_code == status_code

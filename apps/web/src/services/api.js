@@ -1,4 +1,9 @@
-const apiUrl = (import.meta.env.VITE_API_URL ?? import.meta.env.VITE_AGENTS_URL ?? "http://localhost:8000").replace(/\/+$/, "");
+const apiEnvironment = import.meta.env ?? {};
+const apiUrl = (
+  apiEnvironment.VITE_API_URL
+  ?? apiEnvironment.VITE_AGENTS_URL
+  ?? "http://localhost:8000"
+).replace(/\/+$/, "");
 
 async function readResponseBody(response) {
   const contentType = response.headers.get("content-type") ?? "";

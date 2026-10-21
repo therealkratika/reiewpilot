@@ -176,6 +176,36 @@ def test_concurrent_webhook_deliveries_enqueue_only_once(monkeypatch):
     assert len(enqueue_calls) == 2
 
 
+def test_concurrent_distinct_webhook_events_are_both_enqueued(monkeypatch):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    queued = set()
+    lock = threading.Lock()
+
+    def enqueue(event):
+        key = (event["pull_number"], event["head_sha"])
+        with lock:
+            assert key not in queued
+            queued.add(key)
+        return f"job-{event['pull_number']}", True
+
+    monkeypatch.setattr(main, "enqueue_webhook_review", enqueue)
+    first_payload = pull_request_payload(action="synchronize", sha="1" * 40)
+    second_payload = pull_request_payload(action="synchronize", sha="2" * 40)
+    second_payload["pull_request"]["number"] = 8
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(
+            executor.map(signed_request, (first_payload, second_payload))
+        )
+
+    assert all(response.status_code == 202 for response in responses)
+    assert [response.json()["job_id"] for response in responses] == [
+        "job-7",
+        "job-8",
+    ]
+    assert len(queued) == 2
+
+
 def test_initiate_review_publishes_comment_only_review(monkeypatch):
     class FakeClient:
         def get_pull_request(self, owner, repo, number):
