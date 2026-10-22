@@ -1,8 +1,22 @@
-from sqlalchemy import func, select
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
-from app.database import ReviewDatabase
-from app.models import FixProposal, Repository, ReviewFinding, ReviewHistory, WebhookJob
+from app.database import AGENT_ROOT, ReviewDatabase
+from app.models import (
+    AuditLog,
+    FixApproval,
+    FixProposal,
+    Repository,
+    ReviewFinding,
+    ReviewHistory,
+    User,
+    WebhookJob,
+)
 
 
 def _event():
@@ -110,3 +124,106 @@ def test_manual_review_history_can_be_saved_without_webhook_job(tmp_path):
     with Session(database.engine) as session:
         history = session.get(ReviewHistory, review_id)
     assert history.job_id is None
+
+
+def test_review_history_and_fix_approvals_are_scoped_to_user(tmp_path):
+    database = ReviewDatabase(tmp_path / "scoped.sqlite3")
+    now = datetime.now(timezone.utc)
+    user_one = database.upsert_github_user(
+        {"id": 101, "login": "one", "name": "One", "avatar_url": ""},
+        now,
+    )
+    user_two = database.upsert_github_user(
+        {"id": 202, "login": "two", "name": "Two", "avatar_url": ""},
+        now,
+    )
+    review_id = database.save_review_result(_event(), _result(), user_id=user_one)
+    proposal_id = database.get_fix_proposal_id(review_id)
+    proposal = database.get_fix_proposal(proposal_id)
+    approval_id = database.create_fix_approval(
+        fix_proposal_id=proposal_id,
+        user_id=user_one,
+        repository_id=proposal["repository_id"],
+        pull_number=proposal["pull_number"],
+        head_sha=proposal["head_sha"],
+        approved_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+
+    assert len(database.list_user_review_history(user_one)) == 1
+    assert database.list_user_review_history(user_two) == []
+    assert database.get_fix_approval(approval_id, user_one)["head_sha"] == _event()["head_sha"]
+    assert database.get_fix_approval(approval_id, user_two) is None
+
+    with Session(database.engine) as session:
+        assert session.scalar(select(func.count()).select_from(User)) == 2
+        assert session.scalar(select(func.count()).select_from(FixApproval)) == 1
+
+
+def test_logout_revokes_session_and_persists_audit_record(tmp_path):
+    database = ReviewDatabase(tmp_path / "logout.sqlite3")
+    now = datetime.now(timezone.utc)
+    user_id = database.upsert_github_user(
+        {"id": 303, "login": "logout-user", "name": "Logout User", "avatar_url": ""},
+        now,
+    )
+    session_hash = "f" * 64
+    database.create_user_session(
+        user_id,
+        session_hash,
+        "c" * 64,
+        "encrypted",
+        now,
+        now + timedelta(hours=1),
+    )
+    assert database.revoke_user_session(session_hash, now) is True
+    assert database.get_user_session(session_hash, now) is None
+
+    with Session(database.engine) as session:
+        audit = session.scalar(select(AuditLog))
+    assert audit.user_id == user_id
+    assert audit.action == "auth.logout"
+    assert audit.outcome == "revoked"
+
+
+def test_auth_migration_preserves_existing_review_rows(tmp_path):
+    database_path = tmp_path / "existing.sqlite3"
+    url = f"sqlite:///{database_path}"
+    config = Config(str(AGENT_ROOT / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(config, "0001_initial")
+
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO repositories "
+                "(id, owner, name, created_at, updated_at) VALUES "
+                "(1, 'acme', 'widgets', '2025-01-01', '2025-01-01')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pull_requests "
+                "(id, repository_id, number, title, state, head_sha, html_url, created_at, updated_at) "
+                "VALUES (1, 1, 7, 'Existing PR', 'open', :sha, '', '2025-01-01', '2025-01-01')"
+            ),
+            {"sha": "a" * 40},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO review_history "
+                "(id, job_id, pull_request_id, head_sha, summary, status, publication_status, "
+                "created_at, updated_at) VALUES "
+                "(1, NULL, 1, :sha, 'Existing review', 'review_completed', "
+                "'not_attempted', '2025-01-01', '2025-01-01')"
+            ),
+            {"sha": "a" * 40},
+        )
+    command.upgrade(config, "head")
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT id, summary, user_id FROM review_history WHERE id=1")
+        ).one()
+    assert row == (1, "Existing review", None)

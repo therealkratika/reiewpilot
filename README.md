@@ -15,12 +15,22 @@ docker-compose.yml
 render.yaml     API, worker, managed PostgreSQL, and Redis-compatible service
 ```
 
-The web dashboard calls the FastAPI service. The API fetches GitHub pull
-request data and asks Gemini to analyze the diff. Webhooks are verified and
-enqueued as uniquely identified RQ jobs in Redis; a separate worker reviews
-the pull request. SQLAlchemy stores repository and PR metadata, job/review
-history, findings, fix proposals, and publication state. Alembic migrations
-run when the FastAPI application starts.
+The web dashboard calls the FastAPI service. Users sign in through GitHub App
+user authorization. The API keeps an opaque HttpOnly session cookie, stores
+only a hash of the session identifier, and encrypts the GitHub access token at
+rest. User-triggered GitHub operations use that user's credential and check
+live repository permissions. Fix approval records are bound to an exact
+proposal, repository, PR, head SHA, user, and expiry.
+
+The API fetches GitHub pull request data and asks Gemini to analyze the diff.
+Webhooks remain publicly accessible only through HMAC signature verification
+and are enqueued as uniquely identified RQ jobs in Redis; a separate worker
+reviews the pull request. SQLAlchemy stores repository and PR metadata,
+job/review history, findings, fix proposals, and publication state. Alembic
+migrations run when the FastAPI application starts. User-initiated review
+publication, fix approval/publication, logout, and webhook-triggered review
+publication are recorded in an indexed audit table without storing credentials
+or source diffs.
 
 Redis holds queued jobs, retry state, and short-lived worker leases. Review
 and job records are stored in the database; they are not automatically
@@ -33,9 +43,24 @@ limitations and highest-priority risks.
 ### Recommended: Docker Compose
 
 1. Copy `.env.example` to `.env`.
-2. Set `GEMINI_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_WEBHOOK_SECRET` if you
-   plan to use the corresponding features. Keep real credentials out of Git.
-3. From the repository root, run:
+2. Create a GitHub App with user authorization enabled. Grant only the
+   repository permissions needed by the app: Pull requests read/write and
+   Contents read/write only if you intend to publish fix commits. Set the
+   callback URL to `http://localhost:8000/v1/auth/callback`.
+3. Configure `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, and
+   `GITHUB_OAUTH_CALLBACK_URL`. Generate `SESSION_ENCRYPTION_KEY` with:
+
+   ```bash
+   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+   ```
+
+4. For local HTTP development, keep `SESSION_COOKIE_SECURE=false` and
+   `SESSION_COOKIE_SAMESITE=lax`. Use `true` and `none` only with HTTPS.
+5. Set `GEMINI_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_WEBHOOK_SECRET` if you
+   plan to use those features. `GITHUB_TOKEN` is for webhook worker activity;
+   user-triggered API operations use each signed-in user's GitHub App token.
+   Keep real credentials out of Git.
+6. From the repository root, run:
 
    ```bash
    docker compose up --build
@@ -111,13 +136,21 @@ variables.
 |---|---|---|
 | `GEMINI_API_KEY` | FastAPI | Gemini API credential. `GOOGLE_API_KEY` is accepted as a compatibility fallback. |
 | `GEMINI_MODEL` | FastAPI | Optional shared model override. Without it, review uses `gemini-2.5-flash` and fix proposals use `gemini-3.8-flash`. |
-| `GITHUB_TOKEN` | FastAPI/worker | GitHub API credential. Use a fine-grained token or GitHub App installation token with only required repository permissions: Pull requests read for lookup and write for review publication; Contents read when file-content access is needed and write to publish a fix commit. |
+| `GITHUB_TOKEN` | FastAPI/worker | Server credential used by webhook worker activity. Restrict its repository scope and permissions. Interactive API requests use the authenticated user's GitHub App access token instead. |
+| `GITHUB_APP_CLIENT_ID` | FastAPI | GitHub App OAuth client identifier. |
+| `GITHUB_APP_CLIENT_SECRET` | FastAPI | GitHub App OAuth client secret. Server-only; never expose it to Vite. |
+| `GITHUB_OAUTH_CALLBACK_URL` | FastAPI | Exact callback URL configured in the GitHub App, normally `https://<api-host>/v1/auth/callback`. |
+| `APP_ENV` | FastAPI | Set to `production` in deployment; when `WEB_ORIGIN` is absent, production disables browser CORS rather than allowing localhost. |
+| `SESSION_ENCRYPTION_KEY` | FastAPI | Fernet key used to encrypt GitHub access tokens at rest. Keep stable across restarts and back it up securely; changing it invalidates existing stored tokens. |
+| `SESSION_COOKIE_SECURE` | FastAPI | Secure-cookie flag; set `true` in production and `false` only for local HTTP development. |
+| `SESSION_COOKIE_SAMESITE` | FastAPI | Cookie SameSite policy. Use `none` with `secure=true` when dashboard and API are cross-site; local HTTP can use `lax`. |
+| `API_RATE_LIMIT_PER_MINUTE` | FastAPI | Per-user fixed-window limit; defaults to `60`. Redis backs the counter when `REDIS_URL` is configured; otherwise a process-local development fallback is used. |
 | `GITHUB_API_URL` | FastAPI/worker | GitHub API origin; defaults to `https://api.github.com`. |
 | `GITHUB_WEBHOOK_SECRET` | FastAPI | Shared webhook HMAC secret. Required to accept GitHub webhooks. |
 | `REDIS_URL` | FastAPI/worker | Redis connection for durable RQ jobs, retries, and worker leases. Required for webhook enqueueing and processing. |
 | `DATABASE_URL` | FastAPI/worker | SQLAlchemy URL. Defaults to local SQLite at `data/reviewpilot.sqlite3`; use shared PostgreSQL for multi-process/production deployment. Legacy `postgres://` and `postgresql://` URLs are normalized to psycopg. |
 | `DATABASE_PATH` | FastAPI/worker | SQLite file path used only when `DATABASE_URL` is unset; defaults to `data/reviewpilot.sqlite3`. |
-| `WEB_ORIGIN` | FastAPI | Exact browser origin allowed by CORS, for example the deployed dashboard origin. Local Vite origin `http://localhost:5173` is always allowed. |
+| `WEB_ORIGIN` | FastAPI | Exact browser origin allowed by CORS and unsafe-request Origin checks. If configured, no additional localhost origin is allowed. |
 | `PORT` | FastAPI | Listening port for direct module startup; defaults to `8000`. Hosting platforms may provide it automatically. |
 | `VITE_API_URL` | Vite dashboard | FastAPI base URL embedded at frontend build time; defaults to `http://localhost:8000`. |
 | `VITE_AGENTS_URL` | Vite dashboard | Legacy fallback for `VITE_API_URL`; Compose uses this name. |
@@ -151,6 +184,35 @@ comment-only review. It does not create fix commits. Review publication
 markers prevent duplicate comments after retries where GitHub accepted a
 review but the worker did not receive confirmation.
 
+## GitHub login and authorization
+
+Configure a GitHub App with user authorization and use the exact API callback
+URL in both the App and `GITHUB_OAUTH_CALLBACK_URL`. Configure its repository
+permissions narrowly and install it on the repositories to be used. The
+browser is redirected to GitHub by
+`GET /v1/auth/login`; the API validates a one-time OAuth state at
+`GET /v1/auth/callback`, then sets an HttpOnly session cookie and a CSRF cookie.
+The GitHub token is encrypted in the database and never returned to the
+browser. Sessions expire after seven hours; users must sign in again after
+expiry. `POST /v1/auth/logout` revokes the server-side session. Historical
+reviews created before login was introduced retain no user owner and are
+therefore excluded from the user-scoped review-history endpoint.
+
+All sensitive API routes require a valid session. Every repository operation
+checks the user's current GitHub repository permissions; publication requires
+write permission. Mutating browser requests must send the CSRF cookie value in
+`X-CSRF-Token`. CORS is restricted to the configured `WEB_ORIGIN` and is not
+used as authentication. The API rate limiter uses Redis in the deployed
+configuration.
+
+To approve a proposed fix, the dashboard first asks the server to create an
+approval record for the authenticated user and the current PR head SHA. The
+subsequent publication request carries only the returned approval ID; the
+server reloads the stored proposal, rechecks permission and PR SHA immediately
+before commit creation, and consumes the approval once. Dry-run remains the
+backend default. Use HTTPS and a stable, secret `SESSION_ENCRYPTION_KEY` in
+production.
+
 ## API endpoints
 
 The interactive OpenAPI reference is available at `/docs`.
@@ -158,8 +220,12 @@ The interactive OpenAPI reference is available at `/docs`.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | Basic API liveness check; does not verify Redis or GitHub connectivity. |
+| `GET /v1/auth/login` | Start GitHub App OAuth login. |
+| `GET /v1/auth/callback` | Validate OAuth state and establish a secure session. |
+| `GET /v1/auth/me` | Return the authenticated user's public profile. |
+| `POST /v1/auth/logout` | Revoke the current session; requires CSRF token. |
 | `POST /v1/github/webhooks` | Verify and enqueue supported GitHub pull-request events. |
-| `GET /v1/github/jobs/{job_id}` | Read persisted and RQ queue status. |
+| `GET /v1/github/jobs/{job_id}` | Read persisted and RQ queue status after repository authorization. |
 | `GET /v1/github/pulls/{owner}/{repo}/{pull_number}` | Fetch pull-request metadata, diff, and changed files. |
 | `POST /v1/github/pulls/{owner}/{repo}/{pull_number}/review-pipeline` | Analyze a pull request; optionally propose and validate a fix. |
 | `POST /v1/reviews/analyze` | Analyze a supplied diff and validate finding locations. |
@@ -168,15 +234,14 @@ The interactive OpenAPI reference is available at `/docs`.
 | `POST /v1/workflows/review-fix-validate` | Run the review/fix workflow and optional Docker-based JavaScript validation. |
 | `POST /v1/validation/run` | Validate supplied JavaScript files in a constrained Docker container. |
 | `POST /v1/github/reviews/publish` | Publish an explicitly supplied review; dry-run defaults to `true`. |
-| `POST /v1/github/fixes/publish` | Publish a one-file fix commit; dry-run defaults to `true`, and non-dry-run requires `approved: true`. |
+| `POST /v1/github/fixes/{fix_proposal_id}/approve` | Create a server-side approval bound to a proposal and the current PR head. |
+| `POST /v1/github/fixes/publish` | Publish the stored proposal using a server-issued `approval_id`; dry-run defaults to `true`. |
+| `GET /v1/reviews/history` | Return only the authenticated user's manual review history. |
 
-**Production security warning:** Except for GitHub webhook signature
-verification, API routes currently have no caller authentication or
-repository-scoped authorization. CORS is not authentication. The `approved`
-field is a client-provided boolean, not proof of a user's identity or
-approval. Do not expose write-capable publication routes to untrusted users
-or the public internet until server-side authentication and authorization
-are implemented. Use an appropriately restricted GitHub credential.
+`/v1/github/webhooks` is the only public operational API route; it requires the
+existing HMAC signature. AI, repository, validation, history, job, and
+publication routes require an authenticated session. Webhook job status is
+visible only to users with current access to that repository.
 
 The Docker validator requires a working Docker daemon and supports JavaScript
 syntax plus recognized Node test files. The native Render API service does
@@ -227,11 +292,14 @@ service. It does not provision the frontend. To deploy:
 1. Create the Render services from the Blueprint.
 2. Add `GEMINI_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_WEBHOOK_SECRET` as
    private environment values for both API and worker.
-3. Set `WEB_ORIGIN` to the exact deployed dashboard origin; the Blueprint
-   intentionally prompts for this rather than allowing localhost by default.
+3. Set `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`,
+   `GITHUB_OAUTH_CALLBACK_URL`, and a stable generated
+   `SESSION_ENCRYPTION_KEY` as private values on the API service. Set
+   `WEB_ORIGIN` to the exact deployed dashboard origin; configure Secure
+   cookies and `SameSite=None` when needed for cross-site hosting.
 4. If deploying the dashboard, build `apps/web` using `npm ci && npm run
    build` and set `VITE_API_URL` to the public API origin.
-5. Configure the GitHub webhook URL and secret, then verify `/health` and
+5. Configure the GitHub App callback and webhook URL/secret, then verify `/health` and
    inspect a webhook job through its status endpoint.
 
 The API and worker must share the same PostgreSQL and Redis URLs. Alembic
@@ -240,7 +308,9 @@ migrations. Confirm the selected Redis service's persistence and recovery
 guarantees meet queue durability needs. The Render API health check is
 liveness-only; it does not signal queue/database readiness.
 
-Before production, address the missing API authentication/authorization
-described above. Keep provider credentials in Render's environment settings,
-restrict their repository and operation permissions, and do not reuse the
+Remaining limitations: GitHub user access tokens are not refreshed; users
+must sign in again after the seven-hour session expires. The local rate-limit
+fallback is process-local and is intended only for development. Existing
+webhook worker operations still use the separately configured
+`GITHUB_TOKEN`; keep that credential narrowly scoped and do not reuse the
 local Compose database password.

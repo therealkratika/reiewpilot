@@ -1,6 +1,6 @@
 import { useState } from "react";
 import ReviewForm from "../components/ReviewForm";
-import { publishFix, runReviewPipeline } from "../services/api";
+import { approveAndPublishFix, runReviewPipeline } from "../services/api";
 
 function StatCard({ label, value, detail, tone = "" }) {
   return (
@@ -89,7 +89,7 @@ function FixSection({ fix, onPublish, publishing, publishResult }) {
               <pre className="code-block patch-block">{fix.patch || "No patch was returned."}</pre>
             </div>
           </div>
-          {fix.status === "proposal_ready" && fix.updated_code && (
+          {fix.status === "proposal_ready" && fix.proposal_id && (
             <div className="publish-action">
               <div><strong>Human approval required</strong><span>Review the patch above before creating a commit on the PR branch.</span></div>
               <button className="primary-button" onClick={onPublish} disabled={publishing}>
@@ -142,12 +142,13 @@ function ValidationSection({ validation }) {
   );
 }
 
-export default function Dashboard() {
+export default function Dashboard({ user, onLogout }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState(null);
+  const [logoutError, setLogoutError] = useState("");
 
   async function submit(request) {
     setBusy(true);
@@ -166,22 +167,12 @@ export default function Dashboard() {
   async function publishAcceptedFix() {
     const fix = result?.fix;
     const pullRequest = result?.pull_request;
-    if (!fix?.updated_code || !fix.file_path || !pullRequest?.head_sha) return;
+    if (!fix?.proposal_id || !pullRequest?.head_sha) return;
     if (!window.confirm("Create a commit with this fix on the pull request branch? This cannot be undone automatically.")) return;
     setPublishing(true);
     setPublishResult(null);
     try {
-      const [owner, repo] = (pullRequest.repository ?? "").split("/");
-      setPublishResult(await publishFix({
-        owner,
-        repo,
-        pullNumber: pullRequest.pull_number,
-        expectedHeadSha: pullRequest.head_sha,
-        filePath: fix.file_path,
-        updatedCode: fix.updated_code,
-        commitMessage: `Apply ReviewPilot fix: ${fix.file_path}`,
-        approved: true,
-      }));
+      setPublishResult(await approveAndPublishFix(fix.proposal_id));
     } catch (publishError) {
       setPublishResult({ published: false, status: "failed", message: publishError.message });
     } finally {
@@ -211,11 +202,26 @@ export default function Dashboard() {
             <h1>Pull request review</h1>
             <p>Find risks before they reach production. Review changed code and inspect safe fix proposals.</p>
           </div>
-          {result?.pull_request?.html_url && (
-            <a className="external-link" href={result.pull_request.html_url} target="_blank" rel="noreferrer">Open on GitHub ↗</a>
-          )}
+          <div className="account-controls">
+            <div className="account-profile">
+              {user.avatar_url && <img src={user.avatar_url} alt="" />}
+              <span>{user.display_name || user.username}</span>
+            </div>
+            <button className="auth-logout" onClick={async () => {
+              setLogoutError("");
+              try {
+                await onLogout();
+              } catch (logoutRequestError) {
+                setLogoutError(logoutRequestError.message);
+              }
+            }}>Log out</button>
+            {result?.pull_request?.html_url && (
+              <a className="external-link" href={result.pull_request.html_url} target="_blank" rel="noreferrer">Open on GitHub ↗</a>
+            )}
+          </div>
         </header>
 
+        {logoutError && <div className="error-banner" role="alert">{logoutError}</div>}
         <section className="panel request-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">Start a review</span><h2>GitHub pull request</h2></div>

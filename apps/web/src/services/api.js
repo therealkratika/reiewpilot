@@ -5,6 +5,36 @@ const apiUrl = (
   ?? "http://localhost:8000"
 ).replace(/\/+$/, "");
 
+export const apiBaseUrl = apiUrl;
+
+function csrfToken() {
+  if (typeof document === "undefined") return "";
+  const match = document.cookie.match(/(?:^|;\s*)reviewpilot_csrf=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+async function apiFetch(url, options = {}) {
+  const method = (options.method ?? "GET").toUpperCase();
+  const headers = new Headers(options.headers ?? {});
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    headers.set("X-CSRF-Token", csrfToken());
+  }
+  const response = await fetch(url, {
+    ...options,
+    method,
+    headers,
+    credentials: "include",
+  });
+  if (
+    response.status === 401
+    && !url.endsWith("/v1/auth/me")
+    && typeof window !== "undefined"
+  ) {
+    window.dispatchEvent(new Event("reviewpilot:session-expired"));
+  }
+  return response;
+}
+
 async function readResponseBody(response) {
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
@@ -35,7 +65,7 @@ export async function runReviewPipeline({
 
   let response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${apiUrl}/v1/github/pulls/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${pullNumber}/review-pipeline`,
       {
         method: "POST",
@@ -63,32 +93,15 @@ export async function runReviewPipeline({
 
 export const runReview = runReviewPipeline;
 
-export async function publishFix({
-  owner,
-  repo,
-  pullNumber,
-  expectedHeadSha,
-  filePath,
-  updatedCode,
-  commitMessage,
-  dryRun = false,
-  approved = false,
-}) {
+export async function publishFix({ approvalId, dryRun = true }) {
   let response;
   try {
-    response = await fetch(`${apiUrl}/v1/github/fixes/publish`, {
+    response = await apiFetch(`${apiUrl}/v1/github/fixes/publish`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        owner,
-        repo,
-        pull_number: pullNumber,
-        expected_head_sha: expectedHeadSha,
-        file_path: filePath,
-        updated_code: updatedCode,
-        commit_message: commitMessage,
+        approval_id: approvalId,
         dry_run: dryRun,
-        approved,
       }),
     });
   } catch {
@@ -101,4 +114,68 @@ export async function publishFix({
     throw new Error(detail);
   }
   return body;
+}
+
+export async function approveFix(fixProposalId) {
+  let response;
+  try {
+    response = await apiFetch(`${apiUrl}/v1/github/fixes/${fixProposalId}/approve`, {
+      method: "POST",
+    });
+  } catch {
+    throw new Error("Unable to reach the ReviewPilot API. Is the backend running?");
+  }
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    throw new Error(typeof body.detail === "string" ? body.detail : "The fix approval failed.");
+  }
+  return body;
+}
+
+export async function approveAndPublishFix(fixProposalId) {
+  const approval = await approveFix(fixProposalId);
+  return publishFix({ approvalId: approval.approval_id, dryRun: false });
+}
+
+export async function getCurrentUser() {
+  let response;
+  try {
+    response = await apiFetch(`${apiUrl}/v1/auth/me`);
+  } catch {
+    throw new Error("Unable to reach the ReviewPilot API. Is the backend running?");
+  }
+  if (response.status === 401) return null;
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    throw new Error(typeof body.detail === "string" ? body.detail : "Could not verify the session.");
+  }
+  return body.user;
+}
+
+export async function logout() {
+  let response;
+  try {
+    response = await apiFetch(`${apiUrl}/v1/auth/logout`, { method: "POST" });
+  } catch {
+    throw new Error("Unable to reach the ReviewPilot API. Is the backend running?");
+  }
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    throw new Error(typeof body.detail === "string" ? body.detail : "Logout failed.");
+  }
+  return body;
+}
+
+export async function getReviewHistory() {
+  let response;
+  try {
+    response = await apiFetch(`${apiUrl}/v1/reviews/history`);
+  } catch {
+    throw new Error("Unable to reach the ReviewPilot API. Is the backend running?");
+  }
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    throw new Error(typeof body.detail === "string" ? body.detail : "Could not load review history.");
+  }
+  return body.reviews;
 }

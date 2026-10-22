@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+from datetime import datetime, timezone
 from typing import Any
 
 from redis.exceptions import RedisError
@@ -27,6 +28,7 @@ def process_webhook_review_job(job_id: str, event: dict[str, Any]) -> dict[str, 
     token = None
     stop_heartbeat = threading.Event()
     lease_lost = threading.Event()
+    audit_recorded = False
 
     def heartbeat() -> None:
         while not stop_heartbeat.wait(LEASE_REFRESH_SECONDS):
@@ -52,6 +54,22 @@ def process_webhook_review_job(job_id: str, event: dict[str, Any]) -> dict[str, 
             lease_lost.set()
             raise WebhookLeaseLostError("Webhook review lease is no longer owned.")
 
+    def before_publish() -> None:
+        nonlocal audit_recorded
+        assert_lease_owned()
+        if not audit_recorded:
+            database.record_audit_event(
+                user_id=None,
+                action="webhook.review.publish",
+                owner=event["owner"],
+                repo=event["repo"],
+                pull_number=event["pull_number"],
+                resource_id=event["head_sha"],
+                outcome="requested",
+                created_at=datetime.now(timezone.utc),
+            )
+            audit_recorded = True
+
     heartbeat_thread = None
     try:
         store = RedisWebhookEventStore(
@@ -63,7 +81,7 @@ def process_webhook_review_job(job_id: str, event: dict[str, Any]) -> dict[str, 
             raise RuntimeError("A different worker currently owns this webhook review lease.")
         heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
         heartbeat_thread.start()
-        result = initiate_review(event, before_publish=assert_lease_owned)
+        result = initiate_review(event, before_publish=before_publish)
         assert_lease_owned()
         database.save_review_result(event, result, job_id=job_id)
         database.update_job(job_id, "completed")

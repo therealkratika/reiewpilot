@@ -42,15 +42,8 @@ class GitHubPublishInput(BaseModel):
 
 class GitHubFixPublishInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    owner: str = Field(min_length=1, max_length=100)
-    repo: str = Field(min_length=1, max_length=100)
-    pull_number: int = Field(gt=0)
-    expected_head_sha: str = Field(min_length=7, max_length=64)
-    file_path: str = Field(min_length=1, max_length=500)
-    updated_code: str = Field(min_length=1, max_length=60_000)
-    commit_message: str = Field(default="Apply ReviewPilot fix proposal", min_length=1, max_length=200)
+    approval_id: int = Field(gt=0)
     dry_run: bool = True
-    approved: bool = False
 
 
 class GitHubPipelineInput(BaseModel):

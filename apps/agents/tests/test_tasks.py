@@ -26,6 +26,9 @@ class FakeDatabase:
     def save_review_result(self, event, result, *, job_id):
         self.saved.append((event, result, job_id))
 
+    def record_audit_event(self, **values):
+        return None
+
 
 class FakeLeaseStore:
     current_token = None

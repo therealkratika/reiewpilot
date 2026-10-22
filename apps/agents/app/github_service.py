@@ -3,7 +3,7 @@ import json
 from typing import Any, Callable
 from .diff_parser import added_lines_by_file
 from .github_client import GitHubAPIError, GitHubClient
-from .schemas import GitHubFixPublishInput, GitHubPublishInput
+from .schemas import GitHubPublishInput
 
 
 def _review_idempotency_marker(payload, comments):
@@ -149,34 +149,53 @@ def publish_review(
             "html_url": result.get("html_url"), "comment_count": len(comments), "head_sha": current_sha}
 
 
-def publish_fix(payload: GitHubFixPublishInput, client=None) -> dict[str, Any]:
+def publish_fix(
+    *,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    expected_head_sha: str,
+    file_path: str,
+    updated_code: str,
+    commit_message: str,
+    dry_run: bool = True,
+    client=None,
+    before_publish: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     client = client or GitHubClient()
-    path = payload.file_path.removeprefix("a/").removeprefix("b/")
+    path = file_path.removeprefix("a/").removeprefix("b/")
     GitHubClient._validate_file_path(path)
-    pr = client.get_pull_request(payload.owner, payload.repo, payload.pull_number)
+    pr = client.get_pull_request(owner, repo, pull_number)
     if pr.get("state") != "open":
         return {"status": "closed_pr", "published": False, "message": "Only open pull requests can receive fix commits."}
     current_sha = (pr.get("head") or {}).get("sha", "")
     branch = (pr.get("head") or {}).get("ref", "")
-    if current_sha != payload.expected_head_sha:
+    if current_sha != expected_head_sha:
         return {"status": "stale_head_sha", "published": False,
                 "message": "The PR changed since the fix was proposed. Generate a new proposal.",
-                "expected_head_sha": payload.expected_head_sha, "current_head_sha": current_sha}
-    files = client.get_pull_files(payload.owner, payload.repo, payload.pull_number)
+                "expected_head_sha": expected_head_sha, "current_head_sha": current_sha}
+    files = client.get_pull_files(owner, repo, pull_number)
     if not any(item.get("filename") == path for item in files):
         return {"status": "invalid_file_path", "published": False,
                 "message": "The proposed file is not part of the current pull request."}
-    if not payload.dry_run and not payload.approved:
+    if not dry_run and before_publish is None:
         return {"status": "approval_required", "published": False,
                 "message": "Explicit approval is required before creating a commit."}
-    if payload.dry_run:
+    if dry_run:
         return {"status": "dry_run", "published": False,
                 "message": "Head SHA and target file validated; no commit was created.",
                 "file_path": path, "head_sha": current_sha}
+    if before_publish is not None:
+        before_publish(current_sha)
     try:
         commit = client.create_commit_on_branch(
-            payload.owner, payload.repo, branch, payload.expected_head_sha,
-            path, payload.updated_code, payload.commit_message,
+            owner,
+            repo,
+            branch,
+            expected_head_sha,
+            path,
+            updated_code,
+            commit_message,
         )
     except GitHubAPIError:
         raise

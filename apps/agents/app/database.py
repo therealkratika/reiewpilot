@@ -13,11 +13,17 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from .models import (
+    AuditLog,
+    FixApproval,
     FixProposal,
+    OAuthState,
     PullRequest,
     Repository,
+    RepositoryAccess,
     ReviewFinding,
     ReviewHistory,
+    User,
+    UserSession,
     WebhookJob,
 )
 
@@ -69,6 +75,278 @@ class ReviewDatabase:
             config.set_main_option("sqlalchemy.url", self.url.replace("%", "%%"))
             command.upgrade(config, "head")
             _MIGRATED_URLS.add(self.url)
+
+    def create_oauth_state(self, state_hash: str, now: datetime, expires_at: datetime) -> None:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            session.execute(delete(OAuthState).where(OAuthState.expires_at <= now))
+            session.add(OAuthState(state_hash=state_hash, created_at=now, expires_at=expires_at))
+
+    def consume_oauth_state(self, state_hash: str, now: datetime) -> bool:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            result = session.execute(
+                delete(OAuthState).where(
+                    OAuthState.state_hash == state_hash,
+                    OAuthState.expires_at > now,
+                )
+            )
+            return result.rowcount == 1
+
+    def upsert_github_user(self, profile: dict[str, Any], now: datetime) -> int:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            user = session.scalar(select(User).where(User.github_id == int(profile["id"])))
+            if user is None:
+                user = User(
+                    github_id=int(profile["id"]),
+                    github_username=profile["login"],
+                    display_name=profile.get("name") or profile["login"],
+                    avatar_url=profile.get("avatar_url") or "",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(user)
+                session.flush()
+            else:
+                user.github_username = profile["login"]
+                user.display_name = profile.get("name") or profile["login"]
+                user.avatar_url = profile.get("avatar_url") or ""
+                user.updated_at = now
+            return user.id
+
+    def create_user_session(
+        self,
+        user_id: int,
+        session_hash: str,
+        csrf_hash: str,
+        encrypted_access_token: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            session.execute(delete(UserSession).where(UserSession.expires_at <= created_at))
+            session.add(
+                UserSession(
+                    user_id=user_id,
+                    session_hash=session_hash,
+                    csrf_hash=csrf_hash,
+                    encrypted_access_token=encrypted_access_token,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                )
+            )
+
+    def get_user_session(self, session_hash: str, now: datetime) -> dict[str, Any] | None:
+        self.initialize()
+        statement = (
+            select(UserSession, User)
+            .join(User, User.id == UserSession.user_id)
+            .where(
+                UserSession.session_hash == session_hash,
+                UserSession.revoked_at.is_(None),
+                UserSession.expires_at > now,
+            )
+        )
+        with Session(self.engine) as session:
+            row = session.execute(statement).first()
+        if row is None:
+            return None
+        user_session, user = row
+        return {
+            "user_id": user.id,
+            "github_id": user.github_id,
+            "github_username": user.github_username,
+            "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
+            "encrypted_access_token": user_session.encrypted_access_token,
+            "session_hash": user_session.session_hash,
+            "csrf_hash": user_session.csrf_hash,
+            "expires_at": user_session.expires_at,
+        }
+
+    def revoke_user_session(self, session_hash: str, now: datetime) -> bool:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            user_session = session.scalar(
+                select(UserSession).where(UserSession.session_hash == session_hash)
+            )
+            if user_session is None or user_session.revoked_at is not None:
+                return False
+            user_session.revoked_at = now
+            session.add(
+                AuditLog(
+                    user_id=user_session.user_id,
+                    action="auth.logout",
+                    outcome="revoked",
+                    created_at=now,
+                )
+            )
+            return True
+
+    def record_audit_event(
+        self,
+        *,
+        user_id: int | None,
+        action: str,
+        created_at: datetime,
+        owner: str | None = None,
+        repo: str | None = None,
+        pull_number: int | None = None,
+        resource_id: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            session.add(
+                AuditLog(
+                    user_id=user_id,
+                    action=action,
+                    repository_owner=owner,
+                    repository_name=repo,
+                    pull_number=pull_number,
+                    resource_id=resource_id,
+                    outcome=outcome,
+                    created_at=created_at,
+                )
+            )
+
+    def record_repository_access(
+        self,
+        user_id: int,
+        owner: str,
+        repo: str,
+        permission: str,
+        now: datetime,
+    ) -> None:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            repository = self._upsert_repository(session, owner, repo, now)
+            access = session.scalar(
+                select(RepositoryAccess).where(
+                    RepositoryAccess.user_id == user_id,
+                    RepositoryAccess.repository_id == repository.id,
+                )
+            )
+            if access is None:
+                access = RepositoryAccess(
+                    user_id=user_id,
+                    repository_id=repository.id,
+                    permission=permission,
+                    verified_at=now,
+                )
+                session.add(access)
+            else:
+                access.permission = permission
+                access.verified_at = now
+
+    def create_fix_approval(
+        self,
+        *,
+        fix_proposal_id: int,
+        user_id: int,
+        repository_id: int,
+        pull_number: int,
+        head_sha: str,
+        approved_at: datetime,
+        expires_at: datetime,
+    ) -> int:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            approval = FixApproval(
+                fix_proposal_id=fix_proposal_id,
+                user_id=user_id,
+                repository_id=repository_id,
+                pull_number=pull_number,
+                head_sha=head_sha,
+                approved_at=approved_at,
+                expires_at=expires_at,
+            )
+            session.add(approval)
+            session.flush()
+            return approval.id
+
+    def get_fix_approval(self, approval_id: int, user_id: int) -> dict[str, Any] | None:
+        self.initialize()
+        statement = (
+            select(
+                FixApproval.id,
+                FixApproval.user_id,
+                FixApproval.repository_id,
+                FixApproval.pull_number,
+                FixApproval.head_sha,
+                FixApproval.approved_at,
+                FixApproval.expires_at,
+                FixApproval.consumed_at,
+                Repository.owner,
+                Repository.name.label("repo"),
+                FixProposal.file_path,
+                FixProposal.updated_code,
+                ReviewHistory.head_sha.label("proposal_head_sha"),
+            )
+            .join(Repository, Repository.id == FixApproval.repository_id)
+            .join(FixProposal, FixProposal.id == FixApproval.fix_proposal_id)
+            .join(ReviewHistory, ReviewHistory.id == FixProposal.review_id)
+            .join(PullRequest, PullRequest.id == ReviewHistory.pull_request_id)
+            .where(FixApproval.id == approval_id, FixApproval.user_id == user_id)
+            .where(
+                FixApproval.repository_id == PullRequest.repository_id,
+                FixApproval.pull_number == PullRequest.number,
+            )
+        )
+        with Session(self.engine) as session:
+            row = session.execute(statement).mappings().first()
+        if row is None:
+            return None
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in row.items()
+        }
+
+    def get_fix_proposal(self, proposal_id: int) -> dict[str, Any] | None:
+        self.initialize()
+        statement = (
+            select(
+                FixProposal.id.label("fix_proposal_id"),
+                FixProposal.file_path,
+                FixProposal.updated_code,
+                ReviewHistory.head_sha,
+                ReviewHistory.user_id,
+                PullRequest.number.label("pull_number"),
+                PullRequest.head_sha.label("current_head_sha"),
+                Repository.id.label("repository_id"),
+                Repository.owner,
+                Repository.name.label("repo"),
+            )
+            .join(ReviewHistory, ReviewHistory.id == FixProposal.review_id)
+            .join(PullRequest, PullRequest.id == ReviewHistory.pull_request_id)
+            .join(Repository, Repository.id == PullRequest.repository_id)
+            .where(FixProposal.id == proposal_id)
+        )
+        with Session(self.engine) as session:
+            row = session.execute(statement).mappings().first()
+        return dict(row) if row is not None else None
+
+    def consume_fix_approval(
+        self,
+        approval_id: int,
+        user_id: int,
+        now: datetime,
+    ) -> bool:
+        self.initialize()
+        with Session(self.engine) as session, session.begin():
+            result = session.execute(
+                FixApproval.__table__.update()
+                .where(
+                    FixApproval.id == approval_id,
+                    FixApproval.user_id == user_id,
+                    FixApproval.expires_at > now,
+                    FixApproval.consumed_at.is_(None),
+                )
+                .values(consumed_at=now)
+            )
+            return result.rowcount == 1
 
     def register_webhook_job(self, job_id: str, event: dict[str, Any]) -> None:
         self.initialize()
@@ -164,6 +442,7 @@ class ReviewDatabase:
         result: dict[str, Any],
         *,
         job_id: str | None = None,
+        user_id: int | None = None,
     ) -> int | None:
         review = result.get("review")
         if not isinstance(review, dict):
@@ -195,6 +474,7 @@ class ReviewDatabase:
             if history is None:
                 history = ReviewHistory(
                     job_id=job_id,
+                    user_id=user_id,
                     pull_request_id=pull_request.id,
                     head_sha=head_sha,
                     summary=review.get("summary", ""),
@@ -208,6 +488,7 @@ class ReviewDatabase:
                 session.add(history)
                 session.flush()
             else:
+                history.user_id = user_id
                 history.pull_request_id = pull_request.id
                 history.head_sha = head_sha
                 history.summary = review.get("summary", "")
@@ -262,6 +543,50 @@ class ReviewDatabase:
                 )
             return history.id
 
+    def get_fix_proposal_id(self, review_id: int) -> int | None:
+        self.initialize()
+        statement = (
+            select(FixProposal.id)
+            .where(FixProposal.review_id == review_id)
+            .order_by(FixProposal.id.desc())
+            .limit(1)
+        )
+        with Session(self.engine) as session:
+            return session.scalar(statement)
+
+    def list_user_review_history(self, user_id: int) -> list[dict[str, Any]]:
+        self.initialize()
+        statement = (
+            select(
+                ReviewHistory.id,
+                Repository.owner,
+                Repository.name.label("repo"),
+                PullRequest.number.label("pull_number"),
+                ReviewHistory.head_sha,
+                ReviewHistory.summary,
+                ReviewHistory.status,
+                ReviewHistory.publication_status,
+                ReviewHistory.created_at,
+                FixProposal.id.label("fix_proposal_id"),
+                FixProposal.file_path,
+            )
+            .join(PullRequest, PullRequest.id == ReviewHistory.pull_request_id)
+            .join(Repository, Repository.id == PullRequest.repository_id)
+            .outerjoin(FixProposal, FixProposal.review_id == ReviewHistory.id)
+            .where(ReviewHistory.user_id == user_id)
+            .order_by(ReviewHistory.created_at.desc(), ReviewHistory.id.desc())
+            .limit(100)
+        )
+        with Session(self.engine) as session:
+            rows = session.execute(statement).mappings().all()
+        return [
+            {
+                key: value.isoformat() if isinstance(value, datetime) else value
+                for key, value in row.items()
+            }
+            for row in rows
+        ]
+
     def update_review_publication(
         self,
         owner: str,
@@ -269,6 +594,8 @@ class ReviewDatabase:
         pull_number: int,
         head_sha: str,
         publication: dict[str, Any],
+        *,
+        user_id: int | None = None,
     ) -> None:
         self.initialize()
         statement = (
@@ -284,6 +611,8 @@ class ReviewDatabase:
             .order_by(ReviewHistory.id.desc())
             .limit(1)
         )
+        if user_id is not None:
+            statement = statement.where(ReviewHistory.user_id == user_id)
         with Session(self.engine) as session, session.begin():
             history = session.scalar(statement)
             if history is not None:

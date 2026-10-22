@@ -85,6 +85,28 @@ class GitHubClient:
             raise GitHubAPIError(response.status_code, f"GitHub PR lookup failed ({response.status_code}).")
         return response.json()
 
+    def get_repository_permission(self, owner: str, repo: str) -> dict[str, Any]:
+        response = self._get(
+            f"{self.api_url}/repos/{self._identifier(owner, 'owner')}/{self._identifier(repo, 'repository')}",
+            headers=self._headers(),
+        )
+        if not response.ok:
+            raise GitHubAPIError(
+                response.status_code,
+                f"GitHub repository authorization failed ({response.status_code}).",
+            )
+        data = response.json()
+        permissions = data.get("permissions")
+        if not isinstance(permissions, dict):
+            raise GitHubAPIError(403, "GitHub did not return repository permissions.")
+        return {
+            "full_name": data.get("full_name", ""),
+            "pull": bool(permissions.get("pull")),
+            "push": bool(permissions.get("push")),
+            "admin": bool(permissions.get("admin")),
+            "maintain": bool(permissions.get("maintain")),
+        }
+
     def get_pull_diff(self, owner, repo, pull_number):
         response = self._get(
             f"{self.api_url}/repos/{self._identifier(owner, 'owner')}/{self._identifier(repo, 'repository')}/pulls/{pull_number}",

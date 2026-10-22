@@ -2,7 +2,7 @@ import pytest
 
 from app.github_client import GitHubAPIError
 from app.github_service import _review_idempotency_marker, publish_fix, publish_review
-from app.schemas import GitHubFixPublishInput, GitHubPublishInput
+from app.schemas import GitHubPublishInput
 
 
 class FakeGitHub:
@@ -271,48 +271,52 @@ def fix_payload(**overrides):
         "expected_head_sha": "abcdef1234567",
         "file_path": "src/example.js",
         "updated_code": "const answer = 42;\n",
+        "commit_message": "Apply fix",
         "dry_run": False,
-        "approved": True,
     }
     values.update(overrides)
-    return GitHubFixPublishInput(**values)
+    return values
+
+
+def publish_test_fix(payload, client, before_publish=None):
+    return publish_fix(**payload, client=client, before_publish=before_publish)
 
 
 def test_fix_publish_rejects_stale_head_sha():
     client = FakeFixGitHub(sha="different123")
 
-    result = publish_fix(fix_payload(), client)
+    result = publish_test_fix(fix_payload(), client)
 
     assert result["status"] == "stale_head_sha"
     assert client.commits == []
 
 
 def test_fix_publish_rejects_closed_pr():
-    assert publish_fix(fix_payload(), FakeFixGitHub(state="closed"))["status"] == "closed_pr"
+    assert publish_test_fix(fix_payload(), FakeFixGitHub(state="closed"))["status"] == "closed_pr"
 
 
 def test_fix_publish_rejects_file_outside_current_pr():
     client = FakeFixGitHub()
     client.get_pull_files = lambda *args: [{"filename": "src/other.js"}]
-    assert publish_fix(fix_payload(), client)["status"] == "invalid_file_path"
+    assert publish_test_fix(fix_payload(), client)["status"] == "invalid_file_path"
 
 
 def test_fix_publish_dry_run_does_not_create_commit():
     client = FakeFixGitHub()
-    assert publish_fix(fix_payload(dry_run=True), client)["status"] == "dry_run"
+    assert publish_test_fix(fix_payload(dry_run=True), client)["status"] == "dry_run"
     assert client.commits == []
 
 
-def test_fix_publish_requires_explicit_approval():
+def test_fix_publish_requires_server_approval_guard():
     client = FakeFixGitHub()
-    result = publish_fix(fix_payload(approved=False), client)
+    result = publish_test_fix(fix_payload(), client)
     assert result["status"] == "approval_required"
     assert client.commits == []
 
 
 def test_fix_publish_creates_one_file_commit():
     client = FakeFixGitHub()
-    result = publish_fix(fix_payload(), client)
+    result = publish_test_fix(fix_payload(), client, before_publish=lambda _sha: None)
     assert result["status"] == "published"
     assert result["commit_sha"] == "newsha123"
     assert client.commits[0][3:5] == ("abcdef1234567", "src/example.js")
@@ -324,4 +328,4 @@ def test_fix_publish_reports_missing_write_permission():
             raise GitHubAPIError(403, "GitHub token lacks permission to create commits.")
 
     with pytest.raises(GitHubAPIError, match="lacks permission"):
-        publish_fix(fix_payload(), ForbiddenClient())
+        publish_test_fix(fix_payload(), ForbiddenClient(), before_publish=lambda _sha: None)

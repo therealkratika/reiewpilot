@@ -12,6 +12,19 @@ button, input { font: inherit; }
 a { color: inherit; text-decoration: none; }
 
 .app-shell { display: flex; min-height: 100vh; }
+.auth-page { align-items: center; display: flex; justify-content: center; min-height: 100vh; padding: 24px; }
+.auth-card { background: #fff; border: 1px solid #e7ebf3; border-radius: 14px; box-shadow: 0 12px 40px #25395c12; max-width: 430px; padding: 34px; width: 100%; }
+.auth-card .brand { color: #172033; padding: 0; }
+.auth-card h1 { font-size: 25px; margin-top: 32px; }
+.auth-card p { color: #748098; font-size: 13px; margin-bottom: 22px; }
+.auth-button { display: block; text-align: center; }
+.auth-retry, .auth-logout { background: transparent; border: 1px solid #dfe5ef; border-radius: 7px; color: #5968db; cursor: pointer; font-size: 12px; font-weight: 700; padding: 10px 12px; }
+.auth-retry { margin-top: 12px; width: 100%; }
+.account-controls { align-items: center; display: flex; flex-wrap: wrap; gap: 12px; justify-content: flex-end; }
+.account-profile { align-items: center; color: #52617c; display: flex; font-size: 12px; font-weight: 700; gap: 8px; }
+.account-profile img { border-radius: 50%; height: 28px; width: 28px; }
+.auth-logout { padding: 8px 11px; }
+.auth-logout:hover, .auth-retry:hover { background: #f3f5ff; }
 .sidebar { background: #111b32; color: #aab5cd; display: flex; flex-direction: column; padding: 28px 18px 22px; width: 248px; flex-shrink: 0; }
 .brand { align-items: center; color: #fff; display: flex; font-size: 18px; font-weight: 750; gap: 10px; letter-spacing: -.02em; padding: 0 10px; }
 .brand-mark { align-items: center; background: #6875f5; border-radius: 9px; color: #fff; display: inline-flex; font-size: 16px; height: 30px; justify-content: center; width: 30px; }

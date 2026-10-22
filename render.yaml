@@ -21,6 +21,8 @@ services:
         value: 3.12.8
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: APP_ENV
+        value: production
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
@@ -29,6 +31,20 @@ services:
         sync: false
       - key: GITHUB_WEBHOOK_SECRET
         sync: false
+      - key: GITHUB_APP_CLIENT_ID
+        sync: false
+      - key: GITHUB_APP_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_OAUTH_CALLBACK_URL
+        sync: false
+      - key: SESSION_ENCRYPTION_KEY
+        sync: false
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: SESSION_COOKIE_SAMESITE
+        value: none
+      - key: API_RATE_LIMIT_PER_MINUTE
+        value: "60"
       - key: GITHUB_API_URL
         value: https://api.github.com
       - key: WEB_ORIGIN
