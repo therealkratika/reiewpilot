@@ -99,3 +99,8 @@ def test_missing_webhook_secret_is_reported(monkeypatch):
     monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
     response = client.post("/v1/github/webhooks", content=b"{}")
     assert response.status_code == 503
+def calculate_average(numbers):
+    return sum(numbers) / len(numbers)
+
+
+print(calculate_average([]))
