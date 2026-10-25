@@ -9,6 +9,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL

@@ -23,9 +23,17 @@ from .webhook import (
     verify_signature,
 )
 
-repo_env = Path(__file__).resolve().parents[3] / ".env"
-if repo_env.is_file():
-    load_dotenv(repo_env)
+def _find_env_file() -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / ".env"
+        if candidate.is_file():
+            return candidate
+    return None
+
+env_file = _find_env_file()
+if env_file:
+    load_dotenv(env_file)
 else:
     load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -219,3 +227,9 @@ def github_review_pipeline(owner: str, repo: str, pull_number: int, payload: Git
     except Exception as exc:
         logger.exception("GitHub review pipeline failed")
         raise HTTPException(status_code=502, detail="GitHub review pipeline failed. Check server logs.") from exc
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
