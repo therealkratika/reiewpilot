@@ -1,5 +1,23 @@
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
+
+
+def gemini_response_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """Return a Pydantic schema using fields supported by Gemini."""
+    schema = model.model_json_schema()
+
+    def remove_unsupported_fields(value: Any) -> None:
+        if isinstance(value, dict):
+            value.pop("additionalProperties", None)
+            value.pop("additional_properties", None)
+            for nested_value in value.values():
+                remove_unsupported_fields(nested_value)
+        elif isinstance(value, list):
+            for nested_value in value:
+                remove_unsupported_fields(nested_value)
+
+    remove_unsupported_fields(schema)
+    return schema
 
 
 class GitHubPublishComment(BaseModel):
