@@ -3,7 +3,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 def gemini_response_schema(model: type[BaseModel]) -> dict[str, Any]:
-    """Return a Pydantic schema using fields supported by Gemini."""
+    """Return a Pydantic schema without Gemini-unsupported object keywords."""
     schema = model.model_json_schema()
 
     def remove_unsupported_fields(value: Any) -> None:
