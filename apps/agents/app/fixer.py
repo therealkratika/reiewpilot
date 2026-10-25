@@ -28,9 +28,14 @@ def propose_fix(payload: FixInput) -> FixProposal:
             response_schema=FixProposal,
         ),
     )
-    if response.parsed is None:
-        raise RuntimeError("The fixer did not return a structured proposal.")
-    return response.parsed
+    if response.parsed is not None:
+        return response.parsed
+    if getattr(response, "text", None):
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        return FixProposal.model_validate_json(text)
+    raise RuntimeError("The fixer did not return a structured proposal.")
 
 
 def make_unified_diff(file_path: str, original_code: str, updated_code: str) -> str:

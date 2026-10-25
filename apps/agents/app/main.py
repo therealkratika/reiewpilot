@@ -104,6 +104,13 @@ async def github_webhook(request: Request):
 def provider_error(exc: Exception, component: str):
     if isinstance(exc, RuntimeError) and ("API_KEY is not configured" in str(exc) or "GITHUB_TOKEN is not configured" in str(exc)):
         return HTTPException(status_code=503, detail=str(exc))
+    try:
+        from google.genai.errors import APIError
+        if isinstance(exc, APIError):
+            status = exc.code if exc.code in (400, 401, 403, 404, 429) else 502
+            return HTTPException(status_code=status, detail=f"{component} error ({exc.code}): {exc.message}")
+    except ImportError:
+        pass
     logger.exception("%s failed", component)
     return HTTPException(status_code=502, detail=f"{component} failed. Check server logs.")
 

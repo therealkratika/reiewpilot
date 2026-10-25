@@ -23,6 +23,11 @@ def analyze_diff(diff: str) -> ReviewAnalysis:
             response_schema=ReviewAnalysis,
         ),
     )
-    if response.parsed is None:
-        raise RuntimeError("The model did not return a structured review.")
-    return response.parsed
+    if response.parsed is not None:
+        return response.parsed
+    if getattr(response, "text", None):
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        return ReviewAnalysis.model_validate_json(text)
+    raise RuntimeError("The model did not return a structured review.")
