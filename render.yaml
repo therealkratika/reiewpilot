@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: reviewpilot-agents
+    runtime: python
+    rootDir: apps/agents
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.5
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: GITHUB_API_URL
+        value: https://api.github.com
+      - key: WEB_ORIGIN
+        value: http://localhost:5173

@@ -1,0 +1,23 @@
+services:
+  agents:
+    build:
+      context: ./apps/agents
+    working_dir: /app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_AGENTS_URL: http://localhost:8000
+    volumes:
+      - ./apps/web:/app
+    ports:
+      - "5173:5173"
+    depends_on:
+      - agents

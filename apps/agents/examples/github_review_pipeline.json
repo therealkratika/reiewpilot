@@ -1,0 +1,7 @@
+{
+  "propose_fix": false,
+  "validate_fix": false,
+  "target_file": null,
+  "test_files": {},
+  "max_findings": 10
+}
