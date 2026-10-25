@@ -18,7 +18,7 @@ def propose_fix(payload: FixInput) -> FixProposal:
         f"\nBEGIN ORIGINAL FILE\n{payload.original_code}\nEND ORIGINAL FILE"
     )
     client = genai.Client(api_key=api_key)
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     response = client.models.generate_content(
         model=model,
         contents=prompt,
