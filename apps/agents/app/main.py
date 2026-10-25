@@ -116,7 +116,7 @@ def analyze_review(payload: ReviewInput):
         raise provider_error(exc, "Reviewer") from exc
     accepted, warnings = validate_finding_locations(analysis.findings, payload.diff)
     return JSONResponse(content={"repository": payload.repository, "pull_request_number": payload.pull_request_number,
-        "head_sha": payload.head_sha, "model": os.getenv("OPENAI_MODEL", "gpt-5.5"),
+        "head_sha": payload.head_sha, "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         "summary": analysis.summary, "findings": [f.model_dump() for f in accepted],
         "rejected_findings": len(analysis.findings)-len(accepted), "validation_warnings": warnings})
 

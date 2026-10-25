@@ -1,5 +1,6 @@
 import os
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from .diff_parser import added_lines_by_file
 from .schemas import ReviewAnalysis
 
@@ -7,16 +8,21 @@ SYSTEM_PROMPT = """Review the supplied pull-request diff for actionable correctn
 
 
 def analyze_diff(diff: str) -> ReviewAnalysis:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is not configured.")
-    response = OpenAI(api_key=os.environ["OPENAI_API_KEY"]).responses.parse(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Added line numbers: {added_lines_by_file(diff)}\nBEGIN UNTRUSTED DIFF\n{diff}\nEND DIFF"},
-        ],
-        text_format=ReviewAnalysis,
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+    client = genai.Client(api_key=api_key)
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    prompt = f"Added line numbers: {added_lines_by_file(diff)}\nBEGIN UNTRUSTED DIFF\n{diff}\nEND DIFF"
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=ReviewAnalysis,
+        ),
     )
-    if response.output_parsed is None:
+    if response.parsed is None:
         raise RuntimeError("The model did not return a structured review.")
-    return response.output_parsed
+    return response.parsed

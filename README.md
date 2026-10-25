@@ -32,7 +32,7 @@ main Docker Compose flow. The dashboard calls `apps/agents` directly.
 
 ## Local development
 
-Copy `.env.example` to `.env`, then set `OPENAI_API_KEY` and `GITHUB_TOKEN`.
+Copy `.env.example` to `.env`, then set `GEMINI_API_KEY` and `GITHUB_TOKEN`.
 Use a fine-grained GitHub token restricted to a test repository, and keep
 secrets out of source control.
 
@@ -127,7 +127,7 @@ FastAPI service with `apps/agents` as its root directory:
 - Health check: `/health`
 
 Create the service from the Blueprint or configure those values manually.
-Set `OPENAI_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_WEBHOOK_SECRET` as secret
+Set `GEMINI_API_KEY`, `GITHUB_TOKEN`, and `GITHUB_WEBHOOK_SECRET` as secret
 environment variables in Render. `GITHUB_API_URL` defaults to
 `https://api.github.com`; set `WEB_ORIGIN` to the deployed frontend origin
 when the dashboard is hosted outside local Vite.

@@ -11,10 +11,10 @@ services:
         value: 3.12.8
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: OPENAI_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
-      - key: OPENAI_MODEL
-        value: gpt-5.5
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
       - key: GITHUB_TOKEN
         sync: false
       - key: GITHUB_WEBHOOK_SECRET
