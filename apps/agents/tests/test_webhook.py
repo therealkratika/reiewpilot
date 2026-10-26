@@ -99,8 +99,10 @@ def test_missing_webhook_secret_is_reported(monkeypatch):
     monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
     response = client.post("/v1/github/webhooks", content=b"{}")
     assert response.status_code == 503
-def calculate_average(numbers):
-    return sum(numbers) / len(numbers) if numbers else 0
+
+def get_user_email(user):
+    return user["email"]
 
 
-print(calculate_average([]))
+print(get_user_email({}))
+
