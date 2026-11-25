@@ -9,7 +9,7 @@ class FakeGitHub:
     def __init__(self, sha="abcdef1234567"):
         self.sha, self.posted, self.commit_id = sha, None, None
     def get_pull_request(self, owner, repo, number):
-        return {"head": {"sha": self.sha}}
+        return {"state": "open", "head": {"sha": self.sha}}
     def get_pull_diff(self, owner, repo, number):
         return "diff --git a/src/example.js b/src/example.js\n--- a/src/example.js\n+++ b/src/example.js\n@@ -1,1 +1,2 @@\n const a = 1;\n+const b = 2;\n"
     def get_pull_reviews(self, owner, repo, number):
@@ -25,6 +25,54 @@ def test_dry_run_does_not_publish():
     payload = GitHubPublishInput(owner="o", repo="r", pull_number=1, expected_head_sha=client.sha,
         summary="Review", dry_run=True, comments=[{"path":"src/example.js","line":2,"body":"Check this."}])
     assert publish_review(payload, client)["status"] == "dry_run"
+    assert client.posted is None
+
+
+def test_publish_review_aborts_when_worker_loses_lease():
+    client = FakeGitHub()
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[{"path": "src/example.js", "line": 2, "body": "Check this."}],
+    )
+
+    def lost_lease():
+        raise RuntimeError("lease lost")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        publish_review(payload, client, before_publish=lost_lease)
+
+    assert client.posted is None
+
+
+def test_publish_review_rechecks_head_sha_before_posting():
+    class ChangedHeadGitHub(FakeGitHub):
+        requests = 0
+
+        def get_pull_request(self, owner, repo, number):
+            self.requests += 1
+            sha = self.sha if self.requests == 1 else "new-head"
+            return {"state": "open", "head": {"sha": sha}}
+
+    client = ChangedHeadGitHub()
+    payload = GitHubPublishInput(
+        owner="o",
+        repo="r",
+        pull_number=1,
+        expected_head_sha=client.sha,
+        summary="Review",
+        dry_run=False,
+        comments=[{"path": "src/example.js", "line": 2, "body": "Check this."}],
+    )
+
+    result = publish_review(payload, client)
+
+    assert result["status"] == "stale_head_sha"
+    assert result["current_head_sha"] == "new-head"
     assert client.posted is None
 
 

@@ -7,43 +7,6 @@ from app.main import app
 client = TestClient(app)
 
 
-def test_webhook_lock_heartbeat_refreshes_owned_lock(monkeypatch):
-    class FakeStopEvent:
-        def __init__(self):
-            self.wait_calls = []
-            self.results = [False, True]
-
-        def wait(self, interval):
-            self.wait_calls.append(interval)
-            return self.results.pop(0)
-
-    refreshed = []
-
-    class FakeStore:
-        def refresh(self, key):
-            refreshed.append(key)
-            return True
-
-    monkeypatch.setattr(main, "webhook_events", FakeStore())
-    stop_event = FakeStopEvent()
-    key = ("acme/widgets", 7, "abc123")
-
-    main.keep_webhook_lock_alive(key, stop_event)
-
-    assert refreshed == [key]
-    assert stop_event.wait_calls == [300, 300]
-
-
-def test_webhook_lock_heartbeat_is_noop_for_memory_store(monkeypatch):
-    class FakeStopEvent:
-        def wait(self, interval):
-            raise AssertionError("In-memory stores should not start a heartbeat loop.")
-
-    monkeypatch.setattr(main, "webhook_events", object())
-
-    main.keep_webhook_lock_alive(("acme/widgets", 7, "abc123"), FakeStopEvent())
-
-
 def test_review_pipeline_rejects_invalid_request_body():
     response = client.post(
         "/v1/github/pulls/acme/widgets/1/review-pipeline",
@@ -75,3 +38,35 @@ def test_review_pipeline_allows_vite_cors_origin():
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_job_status_reports_persisted_status_when_queue_is_unavailable(monkeypatch):
+    class FakeDatabase:
+        def get_job(self, job_id):
+            return {"job_id": job_id, "status": "retrying"}
+
+    monkeypatch.setattr(main, "ReviewDatabase", FakeDatabase)
+    monkeypatch.setattr(
+        main,
+        "queued_job_status",
+        lambda job_id: (_ for _ in ()).throw(main.QueueUnavailableError("offline")),
+    )
+
+    response = client.get("/v1/github/jobs/webhook-test")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "retrying"
+
+
+def test_job_status_maps_rq_failed_status(monkeypatch):
+    class FakeDatabase:
+        def get_job(self, job_id):
+            return {"job_id": job_id, "status": "retrying"}
+
+    monkeypatch.setattr(main, "ReviewDatabase", FakeDatabase)
+    monkeypatch.setattr(main, "queued_job_status", lambda job_id: "failed")
+
+    response = client.get("/v1/github/jobs/webhook-test")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"

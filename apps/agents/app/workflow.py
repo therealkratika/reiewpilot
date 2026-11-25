@@ -8,12 +8,17 @@ from .validator import run_docker_validation, validate_relative_path
 def validate_patch_scope(file_path: str, patch: str) -> tuple[bool, str]:
     if not patch:
         return False, "The proposed fix does not contain any changes."
-    paths = {
-        line[4:].strip()[2:]
+    try:
+        target = validate_relative_path(file_path)
+    except ValueError:
+        return False, "The target file path is unsafe."
+
+    headers = [
+        line[4:].strip()
         for line in patch.splitlines()
-        if line.startswith(("--- ", "+++ ")) and line[4:].strip().startswith(("a/", "b/"))
-    }
-    if paths != {file_path}:
+        if line.startswith(("--- ", "+++ "))
+    ]
+    if len(headers) != 2 or headers[0] != f"a/{target}" or headers[1] != f"b/{target}":
         return False, "The proposal changes files outside the requested target."
     return True, "The proposal is limited to the requested target file."
 

@@ -22,6 +22,7 @@ reviewpilot/
 │   └── api/                     # Milestone 1 Express scaffold (separate)
 │       └── src/server.ts
 ├── docker-compose.yml
+├── render.yaml
 ├── .env.example
 ├── .gitignore
 └── README.md
@@ -63,8 +64,20 @@ docker compose up --build
 ```
 
 The dashboard is available at <http://localhost:5173>, the agent API at
-<http://localhost:8000/docs>, and the separate Express scaffold can be run
-from `apps/api` with `npm install && npm run dev`.
+<http://localhost:8000/docs>. Compose starts PostgreSQL, Redis, the API, and a
+separate RQ worker. PostgreSQL and Redis data use named Docker volumes. The
+separate Express scaffold can be run from `apps/api` with
+`npm install && npm run dev`.
+
+The backend uses Alembic migrations and SQLAlchemy persistence for observed
+repositories, pull requests, webhook job status, review history, findings,
+fix proposals, and publication status. It stores only the metadata and
+proposal data needed by these features, not GitHub tokens or full PR diffs.
+For local development without Compose, `DATABASE_URL` defaults to
+`sqlite:///data/reviewpilot.sqlite3`; configure a reachable Redis instance in
+`REDIS_URL` to accept webhook jobs. Missing or unavailable Redis causes the
+webhook endpoint to return a retryable `503` rather than accepting a volatile
+background task.
 
 ## Review pipeline
 
@@ -106,24 +119,32 @@ requests**. ReviewPilot verifies `X-Hub-Signature-256` against the raw request
 body before parsing it.
 
 The webhook handles `opened`, `reopened`, and `synchronize` pull-request
-actions. It extracts the repository, PR number, and head SHA, then reuses the
-review pipeline with fix-proposal generation enabled and validation disabled.
-It never commits, applies patches, or publishes review comments automatically.
-Repeated events for the same repository, PR, head SHA, and action are ignored.
+actions. The endpoint verifies the signature, persists a uniquely identified
+job, and enqueues it in Redis-backed RQ; a separate worker performs the review.
+Jobs use a finite retry policy and can be inspected at
+`GET /v1/github/jobs/{job_id}`. RQ retains successful and failed job records
+for 30 and 90 days respectively; application job and review history is stored
+in the database. Database job identity and review history currently have no
+automatic expiry, so the repository/PR/head-SHA deduplication remains
+permanent; define a database retention policy before operating at high volume.
 
-There is currently no durable job queue in this project. Webhook processing is
-synchronous and uses a bounded, process-local idempotency store. This is
-appropriate for local development only; production should put signature
-verification and idempotency in front of a durable worker queue before
-relying on webhook retries or multiple backend instances.
+The worker checks the PR head SHA and its token-fenced Redis lease immediately
+before publishing. It publishes only a comment review when valid findings
+exist; it never commits or applies a fix. A GitHub review marker prevents
+duplicate comments if a worker retries after an uncertain API response.
+Repeated deliveries for the same repository, PR, and head SHA are deduplicated.
+The RQ worker must be deployed separately from the API, and Redis must be
+configured with persistence appropriate for the deployment.
 
 ## Render deployment preparation
 
 The repository includes [render.yaml](./render.yaml), which defines the
-FastAPI service with `apps/agents` as its root directory:
+FastAPI service and RQ worker with `apps/agents` as their root directory, plus
+managed PostgreSQL and Redis-compatible Key Value services:
 
-- Build: `pip install -r requirements.txt`
-- Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Build: `pip install --only-binary=:all: -r requirements-lock.txt`
+- API: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Worker: `python -m app.worker`
 - Health check: `/health`
 
 Create the service from the Blueprint or configure those values manually.
@@ -132,6 +153,10 @@ environment variables in Render. `GITHUB_API_URL` defaults to
 `https://api.github.com`; set `WEB_ORIGIN` to the deployed frontend origin
 when the dashboard is hosted outside local Vite.
 
+The API and worker share the managed PostgreSQL database and Redis service.
+Alembic migrations run when the API starts. Back up the database and use
+backward-compatible migrations when deploying schema changes.
+
 The current Docker validator launches a `node:22-alpine` container through the
 host Docker CLI. A native Render Python service should not be assumed to have
 Docker-in-Docker or a usable Docker daemon, so fix validation will normally
@@ -139,6 +164,6 @@ return an unavailable result there. Do not expose a host Docker socket as a
 shortcut. Use a separate trusted validation worker or an isolated external
 job runner before enabling production fix validation.
 
-The Render service does not automatically publish reviews, commit fixes, or
-apply patches. Those actions remain explicit API operations requiring the
-existing approval and SHA checks.
+Webhook-triggered reviews may publish comment-only reviews when findings are
+present. Fix commits are never created by the webhook worker; they remain an
+explicit API action requiring approval and current-head checks.

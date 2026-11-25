@@ -1,18 +1,24 @@
 
 import logging
 import os
-import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from .database import ReviewDatabase
 from .diff_parser import validate_finding_locations
 from .fixer import make_unified_diff, propose_fix
 from .github_client import GitHubAPIError
 from .github_service import publish_fix, pull_request_snapshot, publish_review
+from .job_queue import (
+    QueueUnavailableError,
+    enqueue_webhook_review,
+    queued_job_status,
+)
 from .pipeline import run_github_review_pipeline
 from .reviewer import analyze_diff
 from .schemas import (
@@ -28,10 +34,6 @@ from .schemas import (
 from .validator import run_docker_validation
 from .workflow import run_review_and_fix, run_review_fix_validate
 from .webhook import (
-    RedisWebhookEventStore,
-    WebhookEventStore,
-    event_key,
-    initiate_review,
     parse_pull_request_event,
     verify_signature,
 )
@@ -59,9 +61,16 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reviewpilot")
 
+@asynccontextmanager
+async def lifespan(_app):
+    ReviewDatabase().initialize()
+    yield
+
+
 app = FastAPI(
     title="ReviewPilot Agent Service",
     version="0.8.0",
+    lifespan=lifespan,
 )
 
 
@@ -82,78 +91,6 @@ app.add_middleware(
 )
 
 
-# Webhook event store
-redis_url = os.getenv("REDIS_URL")
-
-if redis_url:
-    webhook_events = RedisWebhookEventStore(redis_url)
-else:
-    logger.warning(
-        "REDIS_URL is missing. Using in-memory webhook storage."
-    )
-    webhook_events = WebhookEventStore()
-
-
-# Background webhook processing
-def keep_webhook_lock_alive(
-    key: tuple[str, int, str],
-    stop_event: threading.Event,
-) -> None:
-    refresh = getattr(webhook_events, "refresh", None)
-    if refresh is None:
-        return
-    interval = 300
-    while not stop_event.wait(interval):
-        try:
-            if not refresh(key):
-                logger.warning("Webhook lock lost: %s", key)
-                return
-        except Exception:
-            logger.exception("Failed to refresh webhook lock: %s", key)
-            return
-
-
-def process_webhook_review(event: dict, key: tuple[str, int, str]) -> None:
-    stop_event = threading.Event()
-    heartbeat = threading.Thread(
-        target=keep_webhook_lock_alive,
-        args=(key, stop_event),
-        daemon=True,
-    )
-    heartbeat.start()
-    try:
-        result = initiate_review(event)
-
-        result_status = (
-            result.get("status", "completed")
-            if isinstance(result, dict)
-            else "completed"
-        )
-
-        logger.info(
-            "Webhook review completed: %s PR #%s, head SHA %s. Status: %s",
-            f"{event['owner']}/{event['repo']}",
-            event["pull_number"],
-            event["head_sha"],
-            result_status,
-        )
-
-    except Exception:
-        # Release the event so a later GitHub redelivery
-        # can attempt the review again.
-        webhook_events.release(key)
-
-        logger.exception(
-            "Webhook review failed: %s PR #%s, head SHA %s",
-            f"{event['owner']}/{event['repo']}",
-            event["pull_number"],
-            event["head_sha"],
-        )
-    finally:
-        stop_event.set()
-        heartbeat.join()
-
-
 # Health check
 @app.get("/health")
 def health():
@@ -166,11 +103,22 @@ def health():
 
 # GitHub webhook endpoint
 @app.post("/v1/github/webhooks")
-async def github_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-):
-    body = await request.body()
+async def github_webhook(request: Request):
+    max_body_bytes = 1_000_000
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_body_bytes:
+                raise HTTPException(status_code=413, detail="Webhook body is too large.")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.") from exc
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_body_bytes:
+            raise HTTPException(status_code=413, detail="Webhook body is too large.")
+        body.extend(chunk)
+    raw_body = bytes(body)
 
     secret = os.getenv("GITHUB_WEBHOOK_SECRET")
 
@@ -182,7 +130,7 @@ async def github_webhook(
 
     # Verify GitHub signature
     if not verify_signature(
-        body,
+        raw_body,
         request.headers.get("x-hub-signature-256"),
         secret,
     ):
@@ -203,7 +151,7 @@ async def github_webhook(
 
     # Parse webhook payload
     try:
-        event = parse_pull_request_event(body)
+        event = parse_pull_request_event(raw_body)
 
     except ValueError as exc:
         raise HTTPException(
@@ -225,38 +173,57 @@ async def github_webhook(
             status_code=202,
         )
 
-    # Prevent duplicate processing
-    key = event_key(event)
+    try:
+        job_id, enqueued = enqueue_webhook_review(event)
+    except QueueUnavailableError as exc:
+        logger.exception("Could not enqueue GitHub webhook review")
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not persist or enqueue GitHub webhook review")
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook job service is unavailable. GitHub may retry this delivery.",
+        ) from exc
 
-    if not webhook_events.claim(key):
-        return JSONResponse(
-            {
-                "status": "duplicate",
-                "key": list(key),
-            },
-            status_code=202,
-        )
-
-    # Schedule AI review in the background
-    background_tasks.add_task(
-        process_webhook_review,
-        event,
-        key,
-    )
-
-    # Respond to GitHub immediately
     return JSONResponse(
         {
-            "status": "accepted",
-            "message": "Pull request review queued.",
+            "status": "accepted" if enqueued else "duplicate",
+            "message": "Pull request review queued." if enqueued else "This pull request head is already queued or processed.",
+            "job_id": job_id,
             "repository": f"{event['owner']}/{event['repo']}",
             "pull_number": event["pull_number"],
             "head_sha": event["head_sha"],
             "action": event["action"],
-            "publishing": False,
+            "publishing": True,
         },
         status_code=202,
     )
+
+
+@app.get("/v1/github/jobs/{job_id}")
+def get_webhook_job(job_id: str):
+    job = ReviewDatabase().get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Webhook job was not found.")
+    try:
+        queue_status = queued_job_status(job_id)
+    except QueueUnavailableError:
+        queue_status = None
+    if queue_status:
+        job["queue_status"] = queue_status
+        status_map = {
+            "queued": "queued",
+            "started": "started",
+            "scheduled": "retrying",
+            "deferred": "queued",
+            "finished": "completed",
+            "failed": "failed",
+            "stopped": "failed",
+            "canceled": "failed",
+        }
+        if queue_status in status_map:
+            job["status"] = status_map[queue_status]
+    return job
 
 
 # Provider error handling
@@ -487,6 +454,13 @@ def get_github_pull(
 def publish_github_review(payload: GitHubPublishInput):
     try:
         result = publish_review(payload)
+        ReviewDatabase().update_review_publication(
+            payload.owner,
+            payload.repo,
+            payload.pull_number,
+            payload.expected_head_sha,
+            result,
+        )
 
         code = (
             409
@@ -536,6 +510,14 @@ def publish_github_review(payload: GitHubPublishInput):
 def publish_github_fix(payload: GitHubFixPublishInput):
     try:
         result = publish_fix(payload)
+        ReviewDatabase().update_fix_publication(
+            payload.owner,
+            payload.repo,
+            payload.pull_number,
+            payload.expected_head_sha,
+            payload.file_path.removeprefix("a/").removeprefix("b/"),
+            result,
+        )
 
         code = {
             "stale_head_sha": 409,
@@ -600,6 +582,16 @@ def github_review_pipeline(
             repo,
             pull_number,
             payload,
+        )
+        ReviewDatabase().save_review_result(
+            {
+                "owner": owner,
+                "repo": repo,
+                "pull_number": pull_number,
+                "head_sha": (result.get("pull_request") or {}).get("head_sha", ""),
+                "action": "manual",
+            },
+            result,
         )
 
         return JSONResponse(content=result)

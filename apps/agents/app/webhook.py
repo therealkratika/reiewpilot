@@ -2,9 +2,10 @@ import hashlib
 import hmac
 import json
 import threading
+import time
 import uuid
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Callable
 
 import redis
 
@@ -15,27 +16,44 @@ from .schemas import GitHubPipelineInput, GitHubPublishInput
 
 RELEVANT_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 MAX_PROCESSED_EVENTS = 10_000
+DEFAULT_LEASE_TTL_SECONDS = 180
 
 
 class WebhookEventStore:
-    def __init__(self, max_events: int = MAX_PROCESSED_EVENTS):
-        self._events: OrderedDict[tuple[str, int, str], None] = OrderedDict()
+    def __init__(
+        self,
+        max_events: int = MAX_PROCESSED_EVENTS,
+        ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+    ):
+        self._events: OrderedDict[tuple[str, int, str], tuple[str, float]] = OrderedDict()
         self._lock = threading.Lock()
         self._max_events = max_events
+        self._ttl = ttl_seconds
 
-    def claim(self, key: tuple[str, int, str]) -> bool:
+    def claim(self, key: tuple[str, int, str]) -> str | None:
         with self._lock:
-            if key in self._events:
-                return False
-            self._events[key] = None
+            current = self._events.get(key)
+            if current and current[1] > time.monotonic():
+                return None
+            token = uuid.uuid4().hex
+            self._events[key] = (token, time.monotonic() + self._ttl)
             self._events.move_to_end(key)
             while len(self._events) > self._max_events:
                 self._events.popitem(last=False)
-            return True
+            return token
 
-    def release(self, key: tuple[str, int, str]) -> None:
+    def owns(self, key: tuple[str, int, str], token: str) -> bool:
         with self._lock:
-            self._events.pop(key, None)
+            current = self._events.get(key)
+            return bool(current and current[0] == token and current[1] > time.monotonic())
+
+    def release(self, key: tuple[str, int, str], token: str) -> bool:
+        with self._lock:
+            current = self._events.get(key)
+            if not current or current[0] != token or current[1] <= time.monotonic():
+                return False
+            del self._events[key]
+            return True
 
 
 class RedisWebhookEventStore:
@@ -46,63 +64,68 @@ class RedisWebhookEventStore:
     return 0
     """
     RENEW_SCRIPT = """
-    if redis.call("GET", KEYS[1]) == ARGV[1] then
-        return redis.call("EXPIRE", KEYS[1], ARGV[2])
+    if redis.call("GET", KEYS[1]) == ARGV[1] and redis.call("PTTL", KEYS[1]) > 0 then
+        return redis.call("PEXPIRE", KEYS[1], ARGV[2])
     end
     return 0
     """
 
-    def __init__(self, redis_url: str, ttl_seconds: int = 3600):
-        self._redis = redis.Redis.from_url(
+    def __init__(
+        self,
+        redis_url: str | None = None,
+        ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+        *,
+        connection: redis.Redis | None = None,
+    ):
+        if ttl_seconds < 1:
+            raise ValueError("Webhook lease TTL must be positive.")
+        if connection is None and not redis_url:
+            raise ValueError("A Redis URL or connection is required.")
+        self._redis = connection or redis.Redis.from_url(
             redis_url,
             decode_responses=True,
             socket_connect_timeout=3,
-            socket_timeout=3,
+            socket_timeout=5,
         )
         self._ttl = ttl_seconds
-        self._tokens = {}
-        self._lock = threading.Lock()
 
     @staticmethod
     def _key(key: tuple[str, int, str]) -> str:
         repository, pull_number, head_sha = key
-        return f"reviewpilot:webhook:{repository}:{pull_number}:{head_sha}"
+        digest = hashlib.sha256(
+            f"{repository.lower()}:{pull_number}:{head_sha}".encode("utf-8")
+        ).hexdigest()
+        return f"reviewpilot:webhook:lease:{digest}"
 
-    def claim(self, key: tuple[str, int, str]) -> bool:
+    def claim(self, key: tuple[str, int, str]) -> str | None:
         token = uuid.uuid4().hex
-        with self._lock:
-            claimed = self._redis.set(
-                self._key(key),
-                token,
-                nx=True,
-                ex=self._ttl,
-            )
-            if claimed:
-                self._tokens[key] = token
-            return bool(claimed)
+        claimed = self._redis.set(
+            self._key(key),
+            token,
+            nx=True,
+            ex=self._ttl,
+        )
+        return token if claimed else None
 
-    def release(self, key: tuple[str, int, str]) -> None:
-        with self._lock:
-            token = self._tokens.pop(key, None)
-            if token is not None:
-                self._redis.eval(
-                    self.RELEASE_SCRIPT,
-                    1,
-                    self._key(key),
-                    token,
-                )
+    def owns(self, key: tuple[str, int, str], token: str) -> bool:
+        return self._redis.get(self._key(key)) == token
 
-    def refresh(self, key: tuple[str, int, str]) -> bool:
-        with self._lock:
-            token = self._tokens.get(key)
-        if token is None:
-            return False
+    def release(self, key: tuple[str, int, str], token: str) -> bool:
+        result = self._redis.eval(
+            self.RELEASE_SCRIPT,
+            1,
+            self._key(key),
+            token,
+        )
+        return bool(result)
+
+    def refresh(self, key: tuple[str, int, str], token: str) -> bool:
         result = self._redis.eval(
             self.RENEW_SCRIPT,
             1,
             self._key(key),
             token,
-            self._ttl,
+            self._ttl * 1000,
         )
         return bool(result)
 
@@ -125,16 +148,25 @@ def parse_pull_request_event(body: bytes) -> dict[str, Any]:
     action = event.get("action")
     pull_request = event.get("pull_request")
     repository = event.get("repository")
-    owner = (repository or {}).get("owner", {}).get("login")
-    repo = (repository or {}).get("name")
-    pull_number = (pull_request or {}).get("number") or event.get("number")
-    head_sha = ((pull_request or {}).get("head") or {}).get("sha")
+    if not isinstance(pull_request, dict):
+        pull_request = {}
+    if not isinstance(repository, dict):
+        repository = {}
+    repository_owner = repository.get("owner")
+    owner = repository_owner.get("login") if isinstance(repository_owner, dict) else None
+    repo = repository.get("name")
+    pull_number = pull_request.get("number") or event.get("number")
+    pull_head = pull_request.get("head")
+    head_sha = pull_head.get("sha") if isinstance(pull_head, dict) else None
     if not isinstance(action, str):
         raise ValueError("Webhook action is missing.")
     if action in RELEVANT_ACTIONS and (
         not isinstance(owner, str)
+        or not owner
         or not isinstance(repo, str)
+        or not repo
         or not isinstance(pull_number, int)
+        or isinstance(pull_number, bool)
         or pull_number < 1
         or not isinstance(head_sha, str)
         or not head_sha
@@ -171,7 +203,15 @@ def _finding_comment(finding: dict[str, Any]) -> dict[str, Any]:
     return comment
 
 
-def initiate_review(event: dict[str, Any], client=None) -> dict[str, Any]:
+class WebhookLeaseLostError(RuntimeError):
+    pass
+
+
+def initiate_review(
+    event: dict[str, Any],
+    client=None,
+    before_publish: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     client = client or GitHubClient()
     pr = client.get_pull_request(
         event["owner"],
@@ -220,5 +260,9 @@ def initiate_review(event: dict[str, Any], client=None) -> dict[str, Any]:
         dry_run=False,
         comments=[_finding_comment(finding) for finding in review["findings"]],
     )
-    published = publish_review(payload, client=client)
+    published = publish_review(
+        payload,
+        client=client,
+        before_publish=before_publish,
+    )
     return {**result, "publication": published, "published": published["published"]}

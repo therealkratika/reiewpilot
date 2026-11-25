@@ -1,6 +1,6 @@
 import hashlib
 import json
-from typing import Any
+from typing import Any, Callable
 from .diff_parser import added_lines_by_file
 from .github_client import GitHubAPIError, GitHubClient
 from .schemas import GitHubFixPublishInput, GitHubPublishInput
@@ -37,9 +37,19 @@ def pull_request_snapshot(owner: str, repo: str, pull_number: int, client=None) 
                            "additions": i.get("additions"), "deletions": i.get("deletions")} for i in files]}
 
 
-def publish_review(payload: GitHubPublishInput, client=None) -> dict[str, Any]:
+def publish_review(
+    payload: GitHubPublishInput,
+    client=None,
+    before_publish: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     client = client or GitHubClient()
     pr = client.get_pull_request(payload.owner, payload.repo, payload.pull_number)
+    if pr.get("state") != "open":
+        return {
+            "status": "closed_pr",
+            "published": False,
+            "message": "Only open pull requests can receive reviews.",
+        }
     current_sha = (pr.get("head") or {}).get("sha", "")
     if current_sha != payload.expected_head_sha:
         return {"status": "stale_head_sha", "published": False,
@@ -102,6 +112,30 @@ def publish_review(payload: GitHubPublishInput, client=None) -> dict[str, Any]:
                 "review_id": review.get("id"),
                 "head_sha": current_sha,
             }
+    if before_publish is not None:
+        before_publish()
+    latest_pr = client.get_pull_request(
+        payload.owner,
+        payload.repo,
+        payload.pull_number,
+    )
+    latest_sha = (latest_pr.get("head") or {}).get("sha", "")
+    if latest_pr.get("state") != "open":
+        return {
+            "status": "closed_pr",
+            "published": False,
+            "message": "The pull request was closed before the review could be published.",
+        }
+    if latest_sha != current_sha:
+        return {
+            "status": "stale_head_sha",
+            "published": False,
+            "message": "The PR changed before the review could be published.",
+            "expected_head_sha": current_sha,
+            "current_head_sha": latest_sha,
+        }
+    if before_publish is not None:
+        before_publish()
     result = client.create_review(
         payload.owner,
         payload.repo,
@@ -109,7 +143,7 @@ def publish_review(payload: GitHubPublishInput, client=None) -> dict[str, Any]:
         f"{payload.summary}\n\n{marker}",
         payload.event,
         comments,
-        commit_id=current_sha,
+        commit_id=latest_sha,
     )
     return {"status": "published", "published": True, "review_id": result.get("id"),
             "html_url": result.get("html_url"), "comment_count": len(comments), "head_sha": current_sha}

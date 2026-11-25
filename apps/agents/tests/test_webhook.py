@@ -1,7 +1,11 @@
 import hashlib
 import hmac
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 from fastapi.testclient import TestClient
 
 from app import main
@@ -11,6 +15,7 @@ from app.webhook import (
     _finding_comment,
     initiate_review,
 )
+from app.job_queue import QueueUnavailableError
 from app.schemas import Finding, ReviewAnalysis
 
 
@@ -39,17 +44,21 @@ def pull_request_payload(action="opened", sha="a" * 40):
     }
 
 
-def test_valid_signature_initiates_review_without_publishing(monkeypatch):
+def test_valid_signature_enqueues_review_job(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
-    monkeypatch.setattr(main, "webhook_events", WebhookEventStore())
     calls = []
-    monkeypatch.setattr(main, "initiate_review", lambda event: calls.append(event) or {"status": "review_completed"})
+    monkeypatch.setattr(
+        main,
+        "enqueue_webhook_review",
+        lambda event: calls.append(event) or ("webhook-job", True),
+    )
 
     response = signed_request(pull_request_payload())
 
     assert response.status_code == 202
     assert response.json()["status"] == "accepted"
-    assert response.json()["publishing"] is False
+    assert response.json()["publishing"] is True
+    assert response.json()["job_id"] == "webhook-job"
     assert calls[0]["head_sha"] == "a" * 40
 
 
@@ -88,9 +97,16 @@ def test_malformed_relevant_payload_is_rejected(monkeypatch):
 
 def test_duplicate_event_is_not_processed_twice(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
-    monkeypatch.setattr(main, "webhook_events", WebhookEventStore())
-    calls = []
-    monkeypatch.setattr(main, "initiate_review", lambda event: calls.append(event) or {"status": "review_completed"})
+    queued = set()
+
+    def enqueue(event):
+        key = (event["owner"], event["repo"], event["pull_number"], event["head_sha"])
+        if key in queued:
+            return "webhook-job", False
+        queued.add(key)
+        return "webhook-job", True
+
+    monkeypatch.setattr(main, "enqueue_webhook_review", enqueue)
     payload = pull_request_payload(action="synchronize", sha="c" * 40)
 
     first = signed_request(payload)
@@ -98,43 +114,66 @@ def test_duplicate_event_is_not_processed_twice(monkeypatch):
 
     assert first.json()["status"] == "accepted"
     assert second.json()["status"] == "duplicate"
-    assert len(calls) == 1
 
 
 def test_same_pull_request_head_is_not_reviewed_for_multiple_actions(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
-    monkeypatch.setattr(main, "webhook_events", WebhookEventStore())
-    calls = []
-    monkeypatch.setattr(main, "initiate_review", lambda event: calls.append(event) or {"status": "review_completed"})
+    queued = set()
+
+    def enqueue(event):
+        key = (event["owner"], event["repo"], event["pull_number"], event["head_sha"])
+        if key in queued:
+            return "webhook-job", False
+        queued.add(key)
+        return "webhook-job", True
+
+    monkeypatch.setattr(main, "enqueue_webhook_review", enqueue)
 
     opened = signed_request(pull_request_payload(action="opened", sha="d" * 40))
     synchronized = signed_request(pull_request_payload(action="synchronize", sha="d" * 40))
 
     assert opened.json()["status"] == "accepted"
     assert synchronized.json()["status"] == "duplicate"
-    assert len(calls) == 1
 
 
-def test_failed_background_review_can_be_retried(monkeypatch):
+def test_queue_outage_returns_retryable_status_to_github(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
-    monkeypatch.setattr(main, "webhook_events", WebhookEventStore())
-    attempts = []
+    monkeypatch.setattr(
+        main,
+        "enqueue_webhook_review",
+        lambda event: (_ for _ in ()).throw(QueueUnavailableError("Redis unavailable")),
+    )
 
-    def fail_once(event):
-        attempts.append(event)
-        if len(attempts) == 1:
-            raise RuntimeError("temporary failure")
-        return {"status": "review_completed"}
+    response = signed_request(pull_request_payload(action="synchronize", sha="e" * 40))
 
-    monkeypatch.setattr(main, "initiate_review", fail_once)
-    payload = pull_request_payload(action="synchronize", sha="e" * 40)
+    assert response.status_code == 503
 
-    first = signed_request(payload)
-    second = signed_request(payload)
 
-    assert first.status_code == 202
-    assert second.json()["status"] == "accepted"
-    assert len(attempts) == 2
+def test_concurrent_webhook_deliveries_enqueue_only_once(monkeypatch):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    lock = threading.Lock()
+    queued = set()
+    enqueue_calls = []
+
+    def enqueue(event):
+        key = (event["owner"], event["repo"], event["pull_number"], event["head_sha"])
+        with lock:
+            enqueue_calls.append(key)
+            if key in queued:
+                return "webhook-job", False
+            queued.add(key)
+            return "webhook-job", True
+
+    monkeypatch.setattr(main, "enqueue_webhook_review", enqueue)
+    payload = pull_request_payload(action="synchronize", sha="f" * 40)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(lambda _: signed_request(payload), range(2)))
+
+    assert sorted(response.json()["status"] for response in responses) == [
+        "accepted",
+        "duplicate",
+    ]
+    assert len(enqueue_calls) == 2
 
 
 def test_initiate_review_publishes_comment_only_review(monkeypatch):
@@ -277,163 +316,91 @@ def test_missing_webhook_secret_is_reported(monkeypatch):
     assert response.status_code == 503
 
 
-def test_redis_webhook_event_store_claim_and_release(monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.data = {}
-            self.calls = []
+class FakeLeaseRedis:
+    def __init__(self):
+        self.data = {}
+        self.clock = 0
 
-        def set(self, key, value, nx=False, ex=None):
-            self.calls.append(("set", (key, value), {"nx": nx, "ex": ex}))
-            if nx and key in self.data:
-                return None
-            self.data[key] = value
-            return True
+    def set(self, key, value, nx=False, ex=None):
+        if self.get(key) is not None and nx:
+            return None
+        self.data[key] = (value, self.clock + ex)
+        return True
 
-        def eval(self, script, numkeys, key, token):
-            self.calls.append(("eval", (script, numkeys, key, token)))
-            if self.data.get(key) == token:
-                del self.data[key]
-                return 1
+    def get(self, key):
+        item = self.data.get(key)
+        if item and item[1] > self.clock:
+            return item[0]
+        self.data.pop(key, None)
+        return None
+
+    def eval(self, script, numkeys, key, token, *args):
+        if self.get(key) != token:
             return 0
+        if "PEXPIRE" in script:
+            ttl_ms = args[0]
+            self.data[key] = (token, self.clock + ttl_ms / 1000)
+            return 1
+        if "DEL" in script:
+            del self.data[key]
+            return 1
+        return 0
 
-    fake_redis = FakeRedis()
+
+def _fake_lease_store(monkeypatch, ttl_seconds=60):
+    fake_redis = FakeLeaseRedis()
     monkeypatch.setattr(
         "app.webhook.redis.Redis.from_url",
         lambda *args, **kwargs: fake_redis,
     )
-    store = RedisWebhookEventStore("redis://localhost:6379/0", ttl_seconds=60)
-    key = ("acme/widgets", 7, "a" * 40)
-
-    assert store.claim(key) is True
-    store.release(key)
-
-    assert fake_redis.calls[0][0] == "set"
-    assert fake_redis.calls[0][1][0] == "reviewpilot:webhook:acme/widgets:7:" + "a" * 40
-    assert fake_redis.calls[0][2] == {"nx": True, "ex": 60}
-    assert fake_redis.calls[1][0] == "eval"
+    store = RedisWebhookEventStore(
+        "redis://localhost:6379/0",
+        ttl_seconds=ttl_seconds,
+    )
+    return fake_redis, store
 
 
-def test_redis_event_store_claims_event_once(monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.data = {}
+def test_redis_lease_claim_is_atomic_and_release_is_owned(monkeypatch):
+    _, first = _fake_lease_store(monkeypatch)
+    second = RedisWebhookEventStore("redis://localhost:6379/0", ttl_seconds=60)
+    event = ("acme/widgets", 7, "abc123")
 
-        def set(self, key, value, nx=False, ex=None):
-            if nx and key in self.data:
-                return None
-            self.data[key] = value
-            return True
+    token = first.claim(event)
 
-        def eval(self, script, numkeys, key, token):
-            if self.data.get(key) == token:
-                del self.data[key]
-                return 1
-            return 0
+    assert token
+    assert second.claim(event) is None
+    assert first.owns(event, token)
+    assert first.release(event, token)
+    assert second.claim(event)
 
-    fake_redis = FakeRedis()
+
+def test_expired_worker_cannot_refresh_or_release_new_lease(monkeypatch):
+    fake_redis, first = _fake_lease_store(monkeypatch, ttl_seconds=10)
+    second = RedisWebhookEventStore("redis://localhost:6379/0", ttl_seconds=10)
+    event = ("acme/widgets", 7, "abc123")
+    old_token = first.claim(event)
+
+    fake_redis.clock += 11
+    new_token = second.claim(event)
+
+    assert new_token and new_token != old_token
+    assert not first.owns(event, old_token)
+    assert not first.refresh(event, old_token)
+    assert not first.release(event, old_token)
+    assert second.owns(event, new_token)
+    assert second.refresh(event, new_token)
+
+
+def test_redis_connection_failure_does_not_grant_a_lease(monkeypatch):
+    class UnavailableRedis:
+        def set(self, *args, **kwargs):
+            raise RedisConnectionError("offline")
+
     monkeypatch.setattr(
         "app.webhook.redis.Redis.from_url",
-        lambda *args, **kwargs: fake_redis,
+        lambda *args, **kwargs: UnavailableRedis(),
     )
     store = RedisWebhookEventStore("redis://localhost:6379/0")
-    event = ("acme/widgets", 7, "abc123")
 
-    assert store.claim(event) is True
-    assert store.claim(event) is False
-
-
-def test_redis_event_store_releases_event(monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.data = {}
-
-        def set(self, key, value, nx=False, ex=None):
-            if nx and key in self.data:
-                return None
-            self.data[key] = value
-            return True
-
-        def eval(self, script, numkeys, key, token):
-            if self.data.get(key) == token:
-                del self.data[key]
-                return 1
-            return 0
-
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(
-        "app.webhook.redis.Redis.from_url",
-        lambda *args, **kwargs: fake_redis,
-    )
-    store = RedisWebhookEventStore("redis://localhost:6379/0")
-    event = ("acme/widgets", 7, "abc123")
-
-    assert store.claim(event) is True
-    store.release(event)
-    assert store.claim(event) is True
-
-
-def test_redis_release_does_not_delete_another_workers_lock(monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.data = {}
-
-        def set(self, key, value, nx=False, ex=None):
-            if nx and key in self.data:
-                return None
-            self.data[key] = value
-            return True
-
-        def eval(self, script, numkeys, key, token):
-            if self.data.get(key) == token:
-                del self.data[key]
-                return 1
-            return 0
-
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(
-        "app.webhook.redis.Redis.from_url",
-        lambda *args, **kwargs: fake_redis,
-    )
-    first_store = RedisWebhookEventStore("redis://localhost:6379/0")
-    second_store = RedisWebhookEventStore("redis://localhost:6379/0")
-    event = ("acme/widgets", 7, "abc123")
-
-    assert first_store.claim(event) is True
-    redis_key = first_store._key(event)
-    del fake_redis.data[redis_key]
-    assert second_store.claim(event) is True
-
-    first_store.release(event)
-
-    assert redis_key in fake_redis.data
-
-
-def test_redis_refresh_only_renews_owned_lock(monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.data = {}
-
-        def set(self, key, value, nx=False, ex=None):
-            if nx and key in self.data:
-                return None
-            self.data[key] = value
-            return True
-
-        def eval(self, script, numkeys, key, token, ttl):
-            if self.data.get(key) == token:
-                return 1
-            return 0
-
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(
-        "app.webhook.redis.Redis.from_url",
-        lambda *args, **kwargs: fake_redis,
-    )
-    store = RedisWebhookEventStore("redis://localhost:6379/0")
-    event = ("acme/widgets", 7, "abc123")
-
-    assert store.claim(event) is True
-    assert store.refresh(event) is True
-    fake_redis.data[store._key(event)] = "another-worker-token"
-    assert store.refresh(event) is False
+    with pytest.raises(RedisConnectionError):
+        store.claim(("acme/widgets", 7, "abc123"))

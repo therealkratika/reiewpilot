@@ -51,3 +51,51 @@ def test_get_pull_reviews_returns_reviews(monkeypatch):
     reviews = client.get_pull_reviews("acme", "widgets", 1)
 
     assert reviews == [{"id": 10, "state": "COMMENTED"}]
+
+
+def test_get_pull_reviews_fetches_all_pages(monkeypatch):
+    client = GitHubClient(token="test-token")
+    first_page = Mock()
+    first_page.ok = True
+    first_page.json.return_value = [{"id": review_id} for review_id in range(100)]
+    second_page = Mock()
+    second_page.ok = True
+    second_page.json.return_value = [{"id": 100}]
+    responses = [first_page, second_page]
+    pages = []
+
+    def fake_get(url, **kwargs):
+        pages.append(kwargs["params"]["page"])
+        return responses.pop(0)
+
+    monkeypatch.setattr("app.github_client.requests.get", fake_get)
+
+    reviews = client.get_pull_reviews("acme", "widgets", 1)
+
+    assert len(reviews) == 101
+    assert pages == [1, 2]
+
+
+def test_get_retries_rate_limited_read(monkeypatch):
+    client = GitHubClient(token="test-token")
+    rate_limited = Mock()
+    rate_limited.status_code = 429
+    rate_limited.headers = {"Retry-After": "0"}
+    successful = Mock()
+    successful.status_code = 200
+    successful.ok = True
+    successful.json.return_value = {"state": "open"}
+    responses = [rate_limited, successful]
+    attempts = []
+
+    def fake_get(*args, **kwargs):
+        attempts.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr("app.github_client.requests.get", fake_get)
+    monkeypatch.setattr("app.github_client.time.sleep", lambda _: None)
+
+    result = client.get_pull_request("acme", "widgets", 1)
+
+    assert result == {"state": "open"}
+    assert len(attempts) == 2

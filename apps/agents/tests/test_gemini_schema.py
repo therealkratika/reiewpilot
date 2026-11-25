@@ -112,3 +112,77 @@ def test_reviewer_does_not_retry_non_retryable_gemini_failure(monkeypatch):
         analyze_diff("diff --git a/a.js b/a.js\n+++ b/a.js\n+const value = 1;\n")
 
     assert attempts == []
+
+
+@pytest.mark.parametrize("status_code", [408, 429])
+def test_reviewer_retries_transient_gemini_rate_limits(monkeypatch, status_code):
+    import app.gemini as gemini
+
+    class FakeAPIError(Exception):
+        def __init__(self, code):
+            super().__init__(f"status {code}")
+            self.code = code
+
+    class FakeResponse:
+        parsed = ReviewAnalysis(summary="Recovered.", findings=[])
+        text = None
+
+    attempts = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise FakeAPIError(status_code)
+            return FakeResponse()
+
+    class FakeClient:
+        models = FakeModels()
+
+    monkeypatch.setattr(gemini, "APIError", FakeAPIError)
+    monkeypatch.setattr(gemini.time, "sleep", lambda _: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.reviewer.genai.Client", lambda api_key: FakeClient())
+
+    result = analyze_diff("diff --git a/a.js b/a.js\n+++ b/a.js\n+const value = 1;\n")
+
+    assert result.summary == "Recovered."
+    assert len(attempts) == 2
+
+
+def test_reviewer_rejects_empty_model_response(monkeypatch):
+    class FakeResponse:
+        parsed = None
+        text = ""
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return FakeResponse()
+
+    class FakeClient:
+        models = FakeModels()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.reviewer.genai.Client", lambda api_key: FakeClient())
+
+    with pytest.raises(RuntimeError, match="did not return a structured review"):
+        analyze_diff("diff --git a/a.js b/a.js\n+++ b/a.js\n+const value = 1;\n")
+
+
+def test_reviewer_rejects_malformed_structured_response(monkeypatch):
+    class FakeResponse:
+        parsed = None
+        text = "{ malformed"
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return FakeResponse()
+
+    class FakeClient:
+        models = FakeModels()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.reviewer.genai.Client", lambda api_key: FakeClient())
+
+    with pytest.raises(ValueError):
+        analyze_diff("diff --git a/a.js b/a.js\n+++ b/a.js\n+const value = 1;\n")

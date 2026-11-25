@@ -12,7 +12,11 @@ logger = logging.getLogger("reviewpilot.gemini")
 
 
 def _is_retryable(exc: Exception) -> bool:
-    return isinstance(exc, APIError) and isinstance(exc.code, int) and 500 <= exc.code < 600
+    return (
+        isinstance(exc, APIError)
+        and isinstance(exc.code, int)
+        and (exc.code in (408, 429) or 500 <= exc.code < 600)
+    )
 
 
 def generate_content_with_retries(
