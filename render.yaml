@@ -32,7 +32,7 @@ services:
       - key: GITHUB_API_URL
         value: https://api.github.com
       - key: WEB_ORIGIN
-        value: http://localhost:5173
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: reviewpilot-db
